@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "dark-factory-plugin",
+  "description": "Portable Dark Factory for Claude Code: detached issue queue, delivery-team agents, and Ralph session loops.",
+  "owner": {
+    "name": "ChervonnyyAnton",
+    "url": "https://github.com/ChervonnyyAnton"
+  },
+  "plugins": [
+    {
+      "name": "dark-factory",
+      "description": "Portable Dark Factory: detached issue queue, delivery-team agents, and Ralph session loops.",
+      "source": "./",
+      "version": "0.1.0",
+      "category": "development",
+      "homepage": "https://github.com/ChervonnyyAnton/dark-factory-plugin"
+    }
+  ]
+}
