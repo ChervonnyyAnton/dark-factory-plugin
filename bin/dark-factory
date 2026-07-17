@@ -205,6 +205,20 @@ def resolve_issue(run, policy, number):
     return found[0]
 
 
+def _assignee_logins(issue):
+    return {a.get("login") for a in issue.get("assignees", []) if a.get("login")}
+
+
+def select_pinned_issue(run, policy, number):
+    issue = resolve_issue(run, policy, number)
+    if str(issue.get("state", "")).upper() != "OPEN":
+        raise ValueError(f"issue #{number} is not open")
+    assignees = set(resolve_assignees(policy, run))
+    if not (_assignee_logins(issue) & assignees):
+        raise ValueError(f"issue #{number} is not assigned to the policy assignees")
+    return issue
+
+
 def reconcile(state, run, policy):
     reconciled = copy.deepcopy(state)
     current = reconciled["issue"]

@@ -55,3 +55,50 @@ class ResolveIssueTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "not found"):
             df.resolve_issue(run, {"repositories": ["org/a"]}, 99)
+
+
+class PinIssueTests(unittest.TestCase):
+    def _issue(self, **overrides):
+        base = {
+            "number": 58, "title": "slice", "url": "u",
+            "createdAt": "2026-01-02T00:00:00Z",
+            "assignees": [{"login": "alice"}], "labels": [],
+            "state": "OPEN", "body": "", "repository": "org/a",
+        }
+        base.update(overrides)
+        return base
+
+    def test_pin_requires_assignee_ignores_labels(self):
+        issue = self._issue(labels=[])  # would fail label filter if applied
+
+        def run(cmd):
+            if cmd[0:3] == ["gh", "issue", "view"]:
+                return Result(json.dumps({k: v for k, v in issue.items() if k != "repository"}))
+            raise AssertionError(cmd)
+
+        policy = {
+            "repositories": ["org/a"],
+            "queue": {"assignees": ["alice"], "labels": ["dark-factory"], "match": "all"},
+        }
+        selected = df.select_pinned_issue(run, policy, 58)
+        self.assertEqual(selected["number"], 58)
+
+    def test_pin_rejects_unassigned(self):
+        issue = self._issue(assignees=[])
+
+        def run(cmd):
+            return Result(json.dumps({k: v for k, v in issue.items() if k != "repository"}))
+
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        with self.assertRaisesRegex(ValueError, "assigned"):
+            df.select_pinned_issue(run, policy, 58)
+
+    def test_pin_rejects_closed(self):
+        issue = self._issue(state="CLOSED")
+
+        def run(cmd):
+            return Result(json.dumps({k: v for k, v in issue.items() if k != "repository"}))
+
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"]}}
+        with self.assertRaisesRegex(ValueError, "open"):
+            df.select_pinned_issue(run, policy, 58)
