@@ -16,10 +16,13 @@ dark_factory = importlib.util.module_from_spec(spec)
 loader.exec_module(dark_factory)
 
 open_pr = dark_factory.open_pr
+push_branch = dark_factory.push_branch
 watch_ci = dark_factory.watch_ci
 merge_ready = dark_factory.merge_ready
 merge_pr = dark_factory.merge_pr
 repair_or_handoff = dark_factory.repair_or_handoff
+reconcile = dark_factory.reconcile
+_review_threads = dark_factory._review_threads
 _controller_iteration = dark_factory._controller_iteration
 StateStore = dark_factory.StateStore
 
@@ -68,6 +71,39 @@ def write_policy(workspace, policy=POLICY):
 
 CHECKS_FIELDS = "name,state,bucket"
 PR_VIEW_FIELDS = "number,url,state,headRefOid,headRefName"
+WORKSPACE = "/workspace/org-repo"
+
+
+def push_command(workspace, branch):
+    return ["git", "-C", str(workspace), "push", "-u", "origin", f"HEAD:{branch}"]
+
+
+def is_push_command(command):
+    return is_git_push_command(command) and command[2] == str(WORKSPACE)
+
+
+def is_git_push_command(command):
+    return len(command) >= 4 and command[0] == "git" and command[1] == "-C" and command[3] == "push"
+
+
+def graphql_review_threads_payload(review_decision="APPROVED", resolved=(True,), has_next_page=False):
+    return json.dumps({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewDecision": review_decision,
+                    "reviewThreads": {
+                        "nodes": [{"isResolved": flag} for flag in resolved],
+                        "pageInfo": {"hasNextPage": has_next_page},
+                    },
+                }
+            }
+        }
+    })
+
+
+def is_graphql_command(command):
+    return command[:3] == ["gh", "api", "graphql"]
 
 
 class OpenPrTests(unittest.TestCase):
@@ -76,6 +112,8 @@ class OpenPrTests(unittest.TestCase):
 
         def run(command):
             commands.append(command)
+            if is_push_command(command):
+                return Result()
             if command[:3] == ["gh", "pr", "list"]:
                 return Result(json.dumps([]))
             if command[:3] == ["gh", "pr", "create"]:
@@ -89,7 +127,7 @@ class OpenPrTests(unittest.TestCase):
 
         state = base_state(pr_title="Ship widget", pr_body="Implemented the widget")
 
-        result = open_pr(run, state)
+        result = open_pr(run, state, WORKSPACE)
 
         self.assertEqual(result["phase"], "ci_wait")
         self.assertEqual(result["pr"], 7)
@@ -97,9 +135,52 @@ class OpenPrTests(unittest.TestCase):
         self.assertIn("Closes #42", result["pr_body"])
         create_command = next(c for c in commands if c[:3] == ["gh", "pr", "create"])
         self.assertIn("Closes #42", create_command[create_command.index("--body") + 1])
+        self.assertIn(push_command(WORKSPACE, "dark-factory/issue-42"), commands)
+        self.assertLess(
+            commands.index(push_command(WORKSPACE, "dark-factory/issue-42")),
+            commands.index(create_command),
+        )
+
+    def test_pushes_the_branch_before_asking_github_about_it(self):
+        commands = []
+
+        def run(command):
+            commands.append(command)
+            if is_push_command(command):
+                return Result()
+            if command[:3] == ["gh", "pr", "list"]:
+                return Result(json.dumps([]))
+            if command[:3] == ["gh", "pr", "create"]:
+                return Result("https://github.com/org/repo/pull/7\n")
+            if command[:3] == ["gh", "pr", "view"]:
+                return Result(json.dumps({
+                    "number": 7, "url": "https://github.com/org/repo/pull/7",
+                    "state": "OPEN", "headRefOid": "sha123", "headRefName": "dark-factory/issue-42",
+                }))
+            raise AssertionError(f"unexpected command: {command}")
+
+        open_pr(run, base_state(pr_title="Ship widget", pr_body="Implemented the widget"), WORKSPACE)
+
+        self.assertEqual(commands[0], push_command(WORKSPACE, "dark-factory/issue-42"))
+
+    def test_raises_and_never_reaches_github_when_push_fails(self):
+        commands = []
+
+        def run(command):
+            commands.append(command)
+            if is_push_command(command):
+                return Result(returncode=1, stderr="remote: permission denied")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with self.assertRaises(RuntimeError):
+            open_pr(run, base_state(pr_title="Ship widget", pr_body="Implemented the widget"), WORKSPACE)
+
+        self.assertEqual(commands, [push_command(WORKSPACE, "dark-factory/issue-42")])
 
     def test_reuses_existing_open_pull_request_for_branch(self):
         def run(command):
+            if is_push_command(command):
+                return Result()
             if command[:3] == ["gh", "pr", "list"]:
                 return Result(json.dumps([{
                     "number": 9, "url": "https://github.com/org/repo/pull/9",
@@ -109,13 +190,15 @@ class OpenPrTests(unittest.TestCase):
 
         state = base_state()
 
-        result = open_pr(run, state)
+        result = open_pr(run, state, WORKSPACE)
 
         self.assertEqual(result["pr"], 9)
         self.assertEqual(result["phase"], "ci_wait")
 
     def test_resuming_open_pr_by_number_short_circuits_creation(self):
         def run(command):
+            if is_push_command(command):
+                return Result()
             if command[:3] == ["gh", "pr", "view"]:
                 return Result(json.dumps({
                     "number": 9, "url": "https://github.com/org/repo/pull/9",
@@ -125,7 +208,7 @@ class OpenPrTests(unittest.TestCase):
 
         state = base_state(pr=9, pr_url="https://github.com/org/repo/pull/9")
 
-        result = open_pr(run, state)
+        result = open_pr(run, state, WORKSPACE)
 
         self.assertEqual(result["head_sha"], "shaABC")
         self.assertEqual(result["phase"], "ci_wait")
@@ -133,7 +216,27 @@ class OpenPrTests(unittest.TestCase):
     def test_missing_branch_raises(self):
         state = base_state(branch=None)
         with self.assertRaises(ValueError):
-            open_pr(lambda command: Result(), state)
+            open_pr(lambda command: Result(), state, WORKSPACE)
+
+
+class PushBranchTests(unittest.TestCase):
+    def test_pushes_head_to_the_named_branch_on_origin(self):
+        commands = []
+
+        def run(command):
+            commands.append(command)
+            return Result()
+
+        push_branch(run, WORKSPACE, "dark-factory/issue-42")
+
+        self.assertEqual(commands, [push_command(WORKSPACE, "dark-factory/issue-42")])
+
+    def test_raises_on_nonzero_returncode(self):
+        def run(command):
+            return Result(returncode=1, stderr="rejected")
+
+        with self.assertRaises(RuntimeError):
+            push_branch(run, WORKSPACE, "dark-factory/issue-42")
 
 
 class WatchCiTests(unittest.TestCase):
@@ -215,15 +318,20 @@ def ready_state(**overrides):
 
 
 class MergeReadyTests(unittest.TestCase):
-    def _run(self, head_sha="sha123", review_decision=None, bucket="pass"):
+    def _run(self, head_sha="sha123", bucket="pass", graphql_payload=None,
+              review_decision="APPROVED", resolved=(True,), has_next_page=False):
         def run(command):
             if command[:3] == ["gh", "pr", "view"]:
                 return Result(json.dumps({
                     "number": 7, "url": "https://github.com/org/repo/pull/7",
-                    "state": "OPEN", "headRefOid": head_sha, "reviewDecision": review_decision,
+                    "state": "OPEN", "headRefOid": head_sha,
                 }))
             if command[:3] == ["gh", "pr", "checks"]:
                 return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": bucket}]))
+            if is_graphql_command(command):
+                if graphql_payload is not None:
+                    return Result(json.dumps(graphql_payload))
+                return Result(graphql_review_threads_payload(review_decision, resolved, has_next_page))
             raise AssertionError(f"unexpected command: {command}")
         return run
 
@@ -238,6 +346,39 @@ class MergeReadyTests(unittest.TestCase):
         run = self._run(review_decision="CHANGES_REQUESTED")
         self.assertFalse(merge_ready(run, ready_state()))
 
+    def test_not_ready_when_review_decision_is_null(self):
+        """A `null`/missing reviewDecision (no review yet) must never be
+        treated as an approval, even though it also isn't a rejection."""
+        run = self._run(review_decision=None)
+        self.assertFalse(merge_ready(run, ready_state()))
+
+    def test_not_ready_when_a_review_thread_is_unresolved(self):
+        run = self._run(resolved=(True, False))
+        self.assertFalse(merge_ready(run, ready_state()))
+
+    def test_not_ready_when_review_threads_page_further(self):
+        """`hasNextPage: true` means the full unresolved count is unknown;
+        the gate must fail closed rather than assume the rest resolved."""
+        run = self._run(has_next_page=True)
+        self.assertFalse(merge_ready(run, ready_state()))
+
+    def test_not_ready_when_graphql_returns_errors(self):
+        run = self._run(graphql_payload={"errors": [{"message": "boom"}]})
+        self.assertFalse(merge_ready(run, ready_state()))
+
+    def test_not_ready_when_graphql_pull_request_is_missing(self):
+        run = self._run(graphql_payload={"data": {"repository": {"pullRequest": None}}})
+        self.assertFalse(merge_ready(run, ready_state()))
+
+    def test_not_ready_when_page_info_is_incomplete(self):
+        run = self._run(graphql_payload={
+            "data": {"repository": {"pullRequest": {
+                "reviewDecision": "APPROVED",
+                "reviewThreads": {"nodes": [], "pageInfo": {}},
+            }}},
+        })
+        self.assertFalse(merge_ready(run, ready_state()))
+
     def test_not_ready_when_checks_are_not_green(self):
         run = self._run(bucket="fail")
         self.assertFalse(merge_ready(run, ready_state()))
@@ -245,6 +386,33 @@ class MergeReadyTests(unittest.TestCase):
     def test_not_ready_without_recorded_security_review(self):
         run = self._run()
         self.assertFalse(merge_ready(run, ready_state(security_review={"status": "fail"})))
+
+
+class ReviewThreadsTests(unittest.TestCase):
+    def test_counts_unresolved_threads_and_returns_decision(self):
+        def run(command):
+            return Result(graphql_review_threads_payload("APPROVED", (True, False, False)))
+
+        decision, unresolved = _review_threads(run, "org/repo", 7)
+
+        self.assertEqual(decision, "APPROVED")
+        self.assertEqual(unresolved, 2)
+
+    def test_fails_closed_on_malformed_json(self):
+        def run(command):
+            return Result("not json")
+
+        self.assertEqual(_review_threads(run, "org/repo", 7), (None, 1))
+
+    def test_fails_closed_when_gh_reports_errors(self):
+        def run(command):
+            return Result(json.dumps({"errors": [{"message": "boom"}]}))
+
+        self.assertEqual(_review_threads(run, "org/repo", 7), (None, 1))
+
+    def test_rejects_repository_without_owner_and_name(self):
+        with self.assertRaises(ValueError):
+            _review_threads(lambda command: Result(), "no-slash", 7)
 
 
 class MergePrTests(unittest.TestCase):
@@ -256,10 +424,12 @@ class MergePrTests(unittest.TestCase):
             if command[:3] == ["gh", "pr", "view"]:
                 return Result(json.dumps({
                     "number": 7, "url": "https://github.com/org/repo/pull/7",
-                    "state": "OPEN", "headRefOid": "sha123", "reviewDecision": None,
+                    "state": "OPEN", "headRefOid": "sha123",
                 }))
             if command[:3] == ["gh", "pr", "checks"]:
                 return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
+            if is_graphql_command(command):
+                return Result(graphql_review_threads_payload())
             if command[:3] == ["gh", "pr", "merge"]:
                 return Result("Merged\n")
             raise AssertionError(f"unexpected command: {command}")
@@ -280,10 +450,12 @@ class MergePrTests(unittest.TestCase):
             if command[:3] == ["gh", "pr", "view"]:
                 return Result(json.dumps({
                     "number": 7, "url": "https://github.com/org/repo/pull/7",
-                    "state": "OPEN", "headRefOid": "stale", "reviewDecision": None,
+                    "state": "OPEN", "headRefOid": "stale",
                 }))
             if command[:3] == ["gh", "pr", "checks"]:
                 return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
+            if is_graphql_command(command):
+                return Result(graphql_review_threads_payload())
             raise AssertionError(f"unexpected command: {command}")
 
         result = merge_pr(run, ready_state(head_sha="sha123"))
@@ -392,6 +564,8 @@ class ControllerIterationTests(unittest.TestCase):
 
             def run(command):
                 commands.append(command)
+                if is_git_push_command(command):
+                    return Result()
                 if command[:3] == ["gh", "pr", "list"]:
                     return Result(json.dumps([]))
                 if command[:3] == ["gh", "pr", "create"]:
@@ -410,6 +584,9 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertEqual(state["phase"], "ci_wait")
             create_command = next(c for c in commands if c[:3] == ["gh", "pr", "create"])
             self.assertIn("Closes #42", create_command[create_command.index("--body") + 1])
+            push_commands = [c for c in commands if is_git_push_command(c)]
+            self.assertEqual(len(push_commands), 1)
+            self.assertLess(commands.index(push_commands[0]), commands.index(create_command))
 
     def test_manual_merge_mode_stops_at_handoff_after_green_ci(self):
         with tempfile.TemporaryDirectory() as workspace:
@@ -429,6 +606,12 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertEqual(state["phase"], "handoff")
             self.assertNotIn(["gh", "pr", "merge"], [c[:3] for c in commands])
 
+    def _matching_issue_view_result(self):
+        return Result(json.dumps({
+            "number": 42, "title": "Ship widget", "url": "https://github.com/org/repo/issues/42",
+            "createdAt": "2026-07-01T00:00:00Z", "assignees": [], "labels": [{"name": "dark-factory"}],
+        }))
+
     def test_auto_merge_mode_merges_after_green_ci_and_strict_gate(self):
         auto_policy = {**POLICY, "merge": {"mode": "auto"}}
         with tempfile.TemporaryDirectory() as workspace:
@@ -441,11 +624,15 @@ class ControllerIterationTests(unittest.TestCase):
                 commands.append(command)
                 if command[:3] == ["gh", "pr", "checks"]:
                     return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
+                if command[:3] == ["gh", "issue", "view"]:
+                    return self._matching_issue_view_result()
                 if command[:3] == ["gh", "pr", "view"]:
                     return Result(json.dumps({
                         "number": 7, "url": "https://github.com/org/repo/pull/7",
-                        "state": "OPEN", "headRefOid": "sha123", "reviewDecision": None,
+                        "state": "OPEN", "headRefOid": "sha123",
                     }))
+                if is_graphql_command(command):
+                    return Result(graphql_review_threads_payload())
                 if command[:3] == ["gh", "pr", "merge"]:
                     return Result("Merged\n")
                 raise AssertionError(f"unexpected command: {command}")
@@ -469,11 +656,15 @@ class ControllerIterationTests(unittest.TestCase):
                 commands.append(command)
                 if command[:3] == ["gh", "pr", "checks"]:
                     return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
+                if command[:3] == ["gh", "issue", "view"]:
+                    return self._matching_issue_view_result()
                 if command[:3] == ["gh", "pr", "view"]:
                     return Result(json.dumps({
                         "number": 7, "url": "https://github.com/org/repo/pull/7",
-                        "state": "OPEN", "headRefOid": "sha123", "reviewDecision": None,
+                        "state": "OPEN", "headRefOid": "sha123",
                     }))
+                if is_graphql_command(command):
+                    return Result(graphql_review_threads_payload())
                 raise AssertionError(f"unexpected command: {command}")
 
             continued = _controller_iteration(store, run)
@@ -482,6 +673,35 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertFalse(continued)
             self.assertEqual(state["phase"], "handoff")
             self.assertNotIn(["gh", "pr", "merge"], [c[:3] for c in commands])
+
+    def test_auto_merge_mode_pauses_when_issue_no_longer_matches_policy_before_merging(self):
+        """Finding 3: revalidate the issue against live policy queue filters
+        immediately before auto-merging, not just at initial selection."""
+        auto_policy = {**POLICY, "merge": {"mode": "auto"}}
+        with tempfile.TemporaryDirectory() as workspace:
+            write_policy(workspace, auto_policy)
+            store = StateStore(workspace)
+            store.save(ready_state(phase="ci_wait"))
+            commands = []
+
+            def run(command):
+                commands.append(command)
+                if command[:3] == ["gh", "pr", "checks"]:
+                    return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
+                if command[:3] == ["gh", "issue", "view"]:
+                    return Result(json.dumps({
+                        "number": 42, "title": "Ship widget", "url": "https://github.com/org/repo/issues/42",
+                        "createdAt": "2026-07-01T00:00:00Z", "assignees": [], "labels": [],
+                    }))
+                raise AssertionError(f"unexpected command: {command}")
+
+            continued = _controller_iteration(store, run)
+
+            state = store.load()
+            self.assertFalse(continued)
+            self.assertEqual(state["phase"], "paused")
+            self.assertNotIn(["gh", "pr", "merge"], [c[:3] for c in commands])
+            self.assertNotIn(True, [is_graphql_command(c) for c in commands])
 
     def test_ci_repair_loop_hands_off_on_fifth_failure(self):
         with tempfile.TemporaryDirectory() as workspace:
@@ -506,6 +726,8 @@ class ControllerIterationTests(unittest.TestCase):
             store = self._store(workspace)
 
             def gh_run(command):
+                if is_git_push_command(command):
+                    return Result()
                 if command[:3] == ["gh", "issue", "list"]:
                     return Result(json.dumps([dict(ISSUE, run_id=None)]))
                 if command[:3] == ["gh", "pr", "list"]:
@@ -547,6 +769,72 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertEqual(store.load()["phase"], "handoff")
             self.assertIn("ready_for_pr", phases_seen)
             self.assertIn("ci_wait", phases_seen)
+
+    def test_repair_success_returns_to_testing_not_directly_to_ci_wait(self):
+        """Finding 4: a successful repair must not jump straight back to
+        `ci_wait` on the strength of stale self/security review evidence;
+        it has to re-earn a fresh judgement pass first."""
+        with tempfile.TemporaryDirectory() as workspace:
+            state = base_state(
+                phase="repairing", pr=7, failed_check="unit-tests",
+                self_review={"status": "pass"}, security_review={"status": "pass"},
+            )
+            store = self._store(workspace, state)
+            attempt = self._attempt(workspace, "success", stdout="fixed the failing check\n")
+
+            continued = _controller_iteration(
+                store, lambda c: Result(),
+                run_provider_fn=lambda *a, **k: attempt,
+            )
+
+            state = store.load()
+            self.assertTrue(continued)
+            self.assertEqual(state["phase"], "testing")
+
+    def test_repair_then_revalidation_walks_judgement_chain_before_rejoining_ci_wait(self):
+        """After `repairing` succeeds, `testing`, `self_review`, and
+        `security_review` must each re-run and record a fresh pass before
+        the branch is re-pushed and `ci_wait` resumes for the existing PR."""
+        with tempfile.TemporaryDirectory() as workspace:
+            state = base_state(
+                phase="repairing", pr=7, pr_url="https://github.com/org/repo/pull/7",
+                pr_title="Ship widget", pr_body="Implemented the widget.\n\nCloses #42",
+                head_sha="old-sha", failed_check="unit-tests",
+                self_review={"status": "pass", "run_dir": "stale"},
+                security_review={"status": "pass", "run_dir": "stale"},
+            )
+            store = self._store(workspace, state)
+            commands = []
+
+            def gh_run(command):
+                commands.append(command)
+                if is_git_push_command(command):
+                    return Result()
+                if command[:3] == ["gh", "pr", "view"]:
+                    return Result(json.dumps({
+                        "number": 7, "url": "https://github.com/org/repo/pull/7",
+                        "state": "OPEN", "headRefOid": "new-sha", "headRefName": "dark-factory/issue-42",
+                    }))
+                raise AssertionError(f"unexpected gh command: {command}")
+
+            def run_provider_fn(workspace_arg, provider, prompt_path, run_id, *, max_turns):
+                return self._attempt(workspace, "success", stdout='{"status": "pass"}\n', run_dir_name=run_id)
+
+            phases_seen = []
+            for _ in range(10):
+                continued = _controller_iteration(store, gh_run, run_provider_fn=run_provider_fn)
+                state = store.load()
+                phases_seen.append(state["phase"])
+                if not continued or state["phase"] == "ci_wait":
+                    break
+
+            self.assertEqual(phases_seen[:3], ["testing", "self_review", "security_review"])
+            self.assertEqual(state["phase"], "ci_wait")
+            self.assertEqual(state["head_sha"], "new-sha")
+            self.assertNotEqual(state["self_review"].get("run_dir"), "stale")
+            self.assertNotEqual(state["security_review"].get("run_dir"), "stale")
+            push_commands = [c for c in commands if is_git_push_command(c)]
+            self.assertEqual(len(push_commands), 1)
 
 
 if __name__ == "__main__":

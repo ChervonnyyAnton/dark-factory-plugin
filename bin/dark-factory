@@ -80,14 +80,18 @@ PHASE_PROVIDER_ROLE = {
 
 # Phase reached after a *passing* attempt. `ready_for_pr` is excluded: a
 # passing pr-author attempt stays in `ready_for_pr` until `open_pr` records a
-# pull request and advances to `ci_wait`.
+# pull request and advances to `ci_wait`. `repairing` is excluded from
+# jumping straight back to `ci_wait`: it must re-earn a fresh
+# testing/self_review/security_review pass (its recorded evidence is stale
+# once new commits land), so it re-enters the judgement chain at `testing`
+# and only reaches `ci_wait` again via `ready_for_pr`'s existing-PR reuse.
 _NEXT_PHASE = {
     "planning": "implementing",
     "implementing": "testing",
     "testing": "self_review",
     "self_review": "security_review",
     "security_review": "ready_for_pr",
-    "repairing": "ci_wait",
+    "repairing": "testing",
 }
 
 # Judgement phases require the role contract's structured pass/fail/blocked
@@ -95,7 +99,7 @@ _NEXT_PHASE = {
 # within `limits.max_check_repairs`, then hands off.
 _JUDGEMENT_PHASES = ("testing", "self_review", "security_review")
 
-_TERMINAL_PHASES = ("merged", "handoff", "idle")
+_TERMINAL_PHASES = ("merged", "handoff", "idle", "paused")
 
 
 def load_policy(root):
@@ -382,15 +386,29 @@ def _advance_judgement_phase(workspace, state, policy, phase, run_provider_fn):
     return _record_repair_or_handoff(state, phase, policy, f"{phase} did not pass")
 
 
-def open_pr(run, state):
-    """Create (or reuse) the pull request for the current issue/branch,
-    ensuring the body records `Closes #N`, and advance to `ci_wait`."""
+def push_branch(run, workspace, branch):
+    """Push the worktree's local commits to `origin/<branch>`. Every
+    provider role contract forbids pushing, so the supervisor performs this
+    step itself, through the same injectable `run` used for GitHub calls,
+    before `open_pr` ever asks GitHub about the branch."""
+    result = run(["git", "-C", str(workspace), "push", "-u", "origin", f"HEAD:{branch}"])
+    returncode = getattr(result, "returncode", 0)
+    if returncode != 0:
+        raise RuntimeError(getattr(result, "stderr", "") or "git push failed")
+    return result
+
+
+def open_pr(run, state, workspace):
+    """Push the branch's commits to origin, then create (or reuse) the pull
+    request for the current issue/branch, ensuring the body records
+    `Closes #N`, and advance to `ci_wait`."""
     state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
     issue = state["issue"]
     repository = issue["repository"]
     branch = state.get("branch")
     if not branch:
         raise ValueError("state must contain a factory branch")
+    push_branch(run, workspace, branch)
     number = issue["number"]
     fields = "number,url,state,headRefOid,headRefName"
 
@@ -495,11 +513,66 @@ def watch_ci(run, state, policy):
     return repair_or_handoff(state, failed, policy)
 
 
+def _repository_parts(repository):
+    owner, separator, name = str(repository).partition("/")
+    if not separator or not owner or not name:
+        raise ValueError("repository must be owner/name")
+    return owner, name
+
+
+def _review_threads(run, repository, number):
+    """Query the PR's `reviewDecision` and paginated `reviewThreads` over
+    GraphQL, returning `(decision, unresolved_count)`. Fails closed to
+    `(None, 1)` on GraphQL errors, missing/malformed data, or an
+    incomplete/further-paginated `pageInfo`, so a caller that requires
+    `unresolved == 0` never treats an unreadable or partially-fetched
+    thread list as clean."""
+    owner, name = _repository_parts(repository)
+    query = (
+        "query($owner:String!, $name:String!, $number:Int!) { repository(owner:$owner,name:$name) "
+        "{ pullRequest(number:$number) { reviewDecision reviewThreads(first:100) "
+        "{ nodes { isResolved } pageInfo { hasNextPage } } } } }"
+    )
+    try:
+        result = _json_result(run([
+            "gh", "api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}",
+            "-F", f"name={name}", "-F", f"number={number}",
+        ]))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None, 1
+    if not isinstance(result, dict) or result.get("errors"):
+        return None, 1
+    data = result.get("data")
+    repository_data = data.get("repository") if isinstance(data, dict) else None
+    pull_request = repository_data.get("pullRequest") if isinstance(repository_data, dict) else None
+    if not isinstance(pull_request, dict):
+        return None, 1
+    threads = pull_request.get("reviewThreads")
+    if not isinstance(threads, dict) or not isinstance(threads.get("nodes"), list):
+        return None, 1
+    nodes = threads["nodes"]
+    if any(
+        not isinstance(node, dict) or not isinstance(node.get("isResolved"), bool)
+        for node in nodes
+    ):
+        return None, 1
+    page_info = threads.get("pageInfo")
+    if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+        return None, 1
+    unresolved = sum(1 for node in nodes if not node["isResolved"])
+    if page_info["hasNextPage"]:
+        # A second page of threads exists but is not fetched; fail closed
+        # rather than assume the unseen threads are resolved.
+        unresolved += 1
+    return pull_request.get("reviewDecision"), unresolved
+
+
 def merge_ready(run, state):
     """True only when every strict auto-merge gate is satisfied against
     fresh GitHub evidence: recorded self/security review pass, an open PR
-    matching the controller-recorded head SHA, no outstanding requested
-    changes, and green required checks."""
+    matching the controller-recorded head SHA, an explicit `APPROVED`
+    review decision (a `null`/missing decision is never treated as a
+    pass), zero unresolved review threads, and green required checks."""
     state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
     if (state.get("self_review") or {}).get("status") != "pass":
         return False
@@ -517,12 +590,13 @@ def merge_ready(run, state):
     try:
         pr = _json_result(run([
             "gh", "pr", "view", str(state["pr"]), "--repo", repository,
-            "--json", "number,url,state,headRefOid,reviewDecision",
+            "--json", "number,url,state,headRefOid",
         ]))
         checks = _json_result(run([
             "gh", "pr", "checks", str(state["pr"]), "--repo", repository,
             "--json", "name,state,bucket",
         ]))
+        decision, unresolved = _review_threads(run, repository, int(state["pr"]))
     except (KeyError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
         return False
     if not isinstance(pr, dict):
@@ -531,9 +605,10 @@ def merge_ready(run, state):
         pr.get("state") == "OPEN"
         and pr.get("number") == state["pr"]
         and pr.get("headRefOid") == state["head_sha"]
-        and pr.get("reviewDecision") != "CHANGES_REQUESTED"
         and _valid_checks(checks)
         and _checks_green(checks)
+        and decision == "APPROVED"
+        and unresolved == 0
     )
 
 
@@ -604,12 +679,18 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
         if not state.get("pr_body"):
             state = _advance_execution_phase(workspace, state, policy, phase, run_provider_fn)
         if state.get("phase") == "ready_for_pr" and state.get("pr_body"):
-            state = open_pr(run, state)
+            state = open_pr(run, state, workspace)
     elif phase == "ci_wait":
         state = watch_ci(run, state, policy)
         if state.get("phase") == "ci_wait" and state.get("ci_checks") == "green":
             if policy.get("merge", {}).get("mode", "manual") == "auto":
-                if merge_ready(run, state):
+                # Re-validate the issue against the live policy queue filters
+                # immediately before merging: labels/assignees may have
+                # drifted since the issue was selected or last reconciled.
+                state = reconcile(state, run, policy)
+                if state.get("phase") == "paused":
+                    pass
+                elif merge_ready(run, state):
                     state = merge_pr(run, state)
                 else:
                     state["phase"] = "handoff"
