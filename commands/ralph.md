@@ -8,6 +8,10 @@ allowed-tools: ["Bash(python3:*)", "Bash(${CLAUDE_PLUGIN_ROOT}/bin/dark-factory 
 
 Start a workspace-local Ralph loop from `$ARGUMENTS`.
 
+```!
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/start-ralph.py" "$ARGUMENTS"
+```
+
 1. Parse `--max-iterations N` (default `0`, unlimited) and
    `--completion-promise TEXT` (default `null`). Reject a missing prompt,
    unknown options, or a max that is not a non-negative integer.
