@@ -527,6 +527,34 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertNotEqual(result["phase"], "paused")
 
+    def test_epic_child_without_assignee_does_not_pause_under_all_match(self):
+        policy = {
+            **POLICY,
+            "queue": {
+                "assignees": ["alice"],
+                "labels": ["dark-factory"],
+                "match": "all",
+            },
+        }
+        state = base_state(
+            issue={**ISSUE, "assignees": [], "labels": [{"name": "dark-factory"}]},
+            focus={"epic": 56},
+        )
+
+        def run(command):
+            if command[:3] == ["gh", "issue", "view"]:
+                return Result(json.dumps({
+                    "number": 42, "title": "Ship widget",
+                    "url": "https://github.com/org/repo/issues/42",
+                    "createdAt": "2026-07-01T00:00:00Z", "state": "OPEN",
+                    "assignees": [], "labels": [{"name": "dark-factory"}],
+                }))
+            raise AssertionError(f"unexpected command: {command}")
+
+        result = reconcile(state, run, policy)
+
+        self.assertNotEqual(result["phase"], "paused")
+
     def test_pinned_issue_without_queue_label_does_not_pause_under_all_match(self):
         policy = {
             **POLICY,
@@ -817,11 +845,18 @@ class ControllerIterationTests(unittest.TestCase):
 
     def test_merged_epic_child_keeps_focus_and_selects_next_child(self):
         with tempfile.TemporaryDirectory() as workspace:
-            state = base_state(phase="merged", focus={"epic": 56})
+            state = base_state(
+                phase="merged",
+                focus={"epic": 56},
+                ci_checks="green",
+                failed_check="unit-tests",
+                merge_error="stale error",
+            )
             store = self._store(workspace, state)
+            commands = []
 
             continued = _controller_iteration(
-                store, lambda command: Result(),
+                store, lambda command: commands.append(command) or Result(),
                 run_provider_fn=self._release_provider(workspace),
             )
 
@@ -830,6 +865,15 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertEqual(state["phase"], "idle")
             self.assertIsNone(state["issue"])
             self.assertEqual(state["focus"], {"epic": 56})
+            self.assertIsNone(state["branch"])
+            self.assertIsNone(state["ci_checks"])
+            self.assertIsNone(state["failed_check"])
+            self.assertIsNone(state["merge_error"])
+            self.assertEqual(commands, [
+                ["git", "-C", str(workspace), "fetch", "origin"],
+                ["git", "-C", str(workspace), "checkout", "main"],
+                ["git", "-C", str(workspace), "reset", "--hard", "origin/main"],
+            ])
 
             next_issue = dict(ISSUE, number=43, title="Next child", run_id=None)
             with mock.patch.object(dark_factory, "_select_next_issue", return_value=next_issue) as select:

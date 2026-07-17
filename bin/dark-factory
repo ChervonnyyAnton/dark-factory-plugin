@@ -363,6 +363,8 @@ def reconcile(state, run, policy):
             str(issue.get("state", "")).upper() == "OPEN"
             and bool(_assignee_logins(issue) & set(assignees))
         )
+    elif (reconciled.get("focus") or {}).get("epic") is not None:
+        matches_policy = epic_child_eligible(issue, policy, assignees)
     else:
         matches_policy = issue_matches(issue, policy, assignees)
     if not matches_policy:
@@ -658,6 +660,12 @@ def push_branch(run, workspace, branch):
     if returncode != 0:
         raise RuntimeError(getattr(result, "stderr", "") or "git push failed")
     return result
+
+
+def reset_workspace_to_main(run, root):
+    run(["git", "-C", str(root), "fetch", "origin"])
+    run(["git", "-C", str(root), "checkout", "main"])
+    run(["git", "-C", str(root), "reset", "--hard", "origin/main"])
 
 
 def open_pr(run, state, workspace):
@@ -1003,10 +1011,13 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
         state = close_epic_if_needed(run, state)
         focus = state.get("focus") or {}
         if state.get("phase") == "merged" and focus:
+            if focus.get("epic") is not None:
+                reset_workspace_to_main(run, workspace)
             state.update(
                 phase="idle",
                 issue=None,
                 pr=None, pr_url=None, pr_title=None, pr_body=None, head_sha=None,
+                branch=None, ci_checks=None, failed_check=None, merge_error=None,
                 testing=None, self_review=None, security_review=None,
                 attempts={},
             )
