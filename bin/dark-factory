@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 DEFAULT_STATE = {
@@ -58,6 +59,69 @@ def issue_matches(issue, policy, assignees):
     if match_mode == "all":
         return assignee_match and label_match
     return assignee_match or label_match
+
+
+def _repository_from_origin(run):
+    remote = run(["git", "remote", "get-url", "origin"]).stdout.strip()
+    if "://" in remote:
+        repository = urlparse(remote).path.lstrip("/")
+    else:
+        repository = remote.rsplit(":", 1)[-1]
+    return repository.rstrip("/").removesuffix(".git")
+
+
+def list_matching_issues(run, policy):
+    repositories = policy.get("repositories") or [_repository_from_origin(run)]
+    assignees = resolve_assignees(policy, run)
+    matches = []
+    fields = "number,title,url,createdAt,assignees,labels"
+    for repository in repositories:
+        result = run([
+            "gh", "issue", "list",
+            "--repo", repository,
+            "--state", "open",
+            "--json", fields,
+        ])
+        for issue in json.loads(result.stdout):
+            issue = dict(issue, repository=repository)
+            if issue_matches(issue, policy, assignees):
+                matches.append(issue)
+    return matches
+
+
+def select_issue(issues):
+    return min(
+        issues,
+        key=lambda issue: (
+            issue["createdAt"],
+            issue["repository"],
+            issue["number"],
+        ),
+        default=None,
+    )
+
+
+def reconcile(state, run, policy):
+    reconciled = copy.deepcopy(state)
+    current = reconciled["issue"]
+    if isinstance(current, dict):
+        repository = current["repository"]
+        number = current["number"]
+    else:
+        repository = reconciled["repository"]
+        number = current
+    fields = "number,title,url,createdAt,assignees,labels"
+    result = run([
+        "gh", "issue", "view", str(number),
+        "--repo", repository,
+        "--json", fields,
+    ])
+    issue = dict(json.loads(result.stdout), repository=repository)
+    if not issue_matches(issue, policy, resolve_assignees(policy, run)):
+        reconciled["phase"] = "paused"
+    elif isinstance(current, dict):
+        reconciled["issue"] = issue
+    return reconciled
 
 
 class StateStore:
