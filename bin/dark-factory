@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
+import copy
+import datetime as dt
+import fcntl
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+
+DEFAULT_STATE = {
+    "version": 1,
+    "requested": "stopped",
+    "phase": "idle",
+    "project": None,
+    "issue": None,
+    "pr": None,
+    "branch": None,
+    "head_sha": None,
+    "attempts": {},
+    "cooldowns": {},
+    "next_wake_at": None,
+    "updated_at": None,
+}
 
 
 def load_policy(root):
@@ -37,6 +58,182 @@ def issue_matches(issue, policy, assignees):
     if match_mode == "all":
         return assignee_match and label_match
     return assignee_match or label_match
+
+
+class StateStore:
+    def __init__(self, root):
+        self.path = Path(root) / ".dark-factory" / "controller.json"
+
+    def load(self):
+        try:
+            saved = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            saved = {}
+        return copy.deepcopy(DEFAULT_STATE) | saved
+
+    def save(self, state, force_requested=None):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.parent / ".state.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        temporary_path = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+            if force_requested is not None:
+                state["requested"] = force_requested
+            try:
+                current = json.loads(self.path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                current = {}
+            if force_requested is None and isinstance(current, dict) and current.get("requested") == "stop":
+                state["requested"] = "stop"
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump(state, temporary, sort_keys=True)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            temporary_path.replace(self.path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+class ControllerLock:
+    def __init__(self, root):
+        self.path = Path(root) / ".dark-factory" / "controller.lock"
+        self.record = None
+        self.descriptor = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *unused):
+        self.release()
+
+    def acquire(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.{os.getpid()}.",
+            )
+            temporary_path = Path(temporary_name)
+            published = False
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                record = {
+                    "pid": os.getpid(),
+                    "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+                os.write(descriptor, (json.dumps(record) + "\n").encode())
+                os.fsync(descriptor)
+                os.link(temporary_path, self.path)
+                published = True
+                self.record = record
+                self.descriptor = descriptor
+                temporary_path.unlink()
+                return self
+            except FileExistsError:
+                self._reclaim_stale_lock()
+            finally:
+                if not published:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                    temporary_path.unlink(missing_ok=True)
+
+    def release(self):
+        if self.record is None:
+            return
+        try:
+            if self._matches_path(self.descriptor):
+                try:
+                    record = json.loads(self.path.read_text())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    record = None
+                if record == self.record:
+                    self.path.unlink(missing_ok=True)
+        finally:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            os.close(self.descriptor)
+            self.descriptor = None
+            self.record = None
+
+    def _reclaim_stale_lock(self):
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        try:
+            record = self._read_record(descriptor)
+            if not self._valid_record(record):
+                raise RuntimeError("dark-factory controller lock is malformed")
+            if self._pid_is_live(record["pid"]):
+                raise RuntimeError("dark-factory controller is already running")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("dark-factory controller is already running") from error
+            if not self._matches_path(descriptor):
+                return
+            record = self._read_record(descriptor)
+            if not self._valid_record(record):
+                raise RuntimeError("dark-factory controller lock is malformed")
+            if self._pid_is_live(record["pid"]):
+                raise RuntimeError("dark-factory controller is already running")
+            self.path.unlink(missing_ok=True)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _matches_path(self, descriptor):
+        try:
+            path_status = self.path.stat()
+        except FileNotFoundError:
+            return False
+        descriptor_status = os.fstat(descriptor)
+        return (path_status.st_dev, path_status.st_ino) == (
+            descriptor_status.st_dev,
+            descriptor_status.st_ino,
+        )
+
+    @staticmethod
+    def _read_record(descriptor):
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            record = json.loads(os.read(descriptor, 65536).decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return record if isinstance(record, dict) else None
+
+    @staticmethod
+    def _valid_record(record):
+        return (
+            isinstance(record, dict)
+            and isinstance(record.get("pid"), int)
+            and not isinstance(record["pid"], bool)
+            and record["pid"] > 0
+            and isinstance(record.get("started_at"), str)
+            and bool(record["started_at"].strip())
+        )
+
+    @staticmethod
+    def _pid_is_live(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
 
 def main(argv=None):
