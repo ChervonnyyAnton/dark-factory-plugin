@@ -324,6 +324,7 @@ def ready_state(**overrides):
         pr=7,
         pr_url="https://github.com/org/repo/pull/7",
         head_sha="sha123",
+        testing={"status": "pass"},
         self_review={"status": "pass"},
         security_review={"status": "pass"},
     )
@@ -400,6 +401,11 @@ class MergeReadyTests(unittest.TestCase):
     def test_not_ready_without_recorded_security_review(self):
         run = self._run()
         self.assertFalse(merge_ready(run, ready_state(security_review={"status": "fail"})))
+
+    def test_not_ready_without_recorded_native_verification(self):
+        run = self._run()
+        self.assertFalse(merge_ready(run, ready_state(testing={"status": "fail"})))
+        self.assertFalse(merge_ready(run, ready_state(testing=None)))
 
 
 class ReviewThreadsTests(unittest.TestCase):

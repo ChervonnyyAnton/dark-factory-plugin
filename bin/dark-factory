@@ -663,11 +663,14 @@ def _review_threads(run, repository, number):
 
 def merge_ready(run, state):
     """True only when every strict auto-merge gate is satisfied against
-    fresh GitHub evidence: recorded self/security review pass, an open PR
-    matching the controller-recorded head SHA, an explicit `APPROVED`
-    review decision (a `null`/missing decision is never treated as a
-    pass), zero unresolved review threads, and green required checks."""
+    fresh GitHub evidence: recorded native verification (`testing`) and
+    self/security review pass, an open PR matching the controller-recorded
+    head SHA, an explicit `APPROVED` review decision (a `null`/missing
+    decision is never treated as a pass), zero unresolved review threads,
+    and green required checks."""
     state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    if (state.get("testing") or {}).get("status") != "pass":
+        return False
     if (state.get("self_review") or {}).get("status") != "pass":
         return False
     if (state.get("security_review") or {}).get("status") != "pass":
