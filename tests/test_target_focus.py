@@ -102,3 +102,54 @@ class PinIssueTests(unittest.TestCase):
         policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"]}}
         with self.assertRaisesRegex(ValueError, "open"):
             df.select_pinned_issue(run, policy, 58)
+
+
+class EpicDiscoveryTests(unittest.TestCase):
+    def test_discovers_tracked_and_body_numbers(self):
+        epic = {
+            "number": 56, "repository": "org/a", "body": "- [ ] #58 — a\n- [ ] #59 — b\n",
+            "state": "OPEN", "assignees": [{"login": "alice"}],
+        }
+
+        def run(cmd):
+            if cmd[0] == "gh" and cmd[1] == "api" and "graphql" in cmd:
+                return Result(json.dumps({
+                    "data": {"repository": {"issue": {
+                        "trackedIssues": {"nodes": [{"number": 60}]}
+                    }}}
+                }))
+            raise AssertionError(cmd)
+
+        numbers = df.discover_epic_child_numbers(run, epic)
+        self.assertEqual(numbers, [60, 58, 59])
+
+    def test_eligibility_allows_unassigned_and_skips_others(self):
+        policy = {"queue": {"assignees": ["alice"], "labels": [], "match": "any"}}
+        assignees = ["alice"]
+        open_unassigned = {
+            "state": "OPEN", "assignees": [], "labels": [], "number": 58,
+        }
+        open_other = {
+            "state": "OPEN",
+            "assignees": [{"login": "bob"}],
+            "labels": [],
+            "number": 59,
+        }
+        open_me = {
+            "state": "OPEN",
+            "assignees": [{"login": "alice"}],
+            "labels": [],
+            "number": 60,
+        }
+        self.assertTrue(df.epic_child_eligible(open_unassigned, policy, assignees))
+        self.assertFalse(df.epic_child_eligible(open_other, policy, assignees))
+        self.assertTrue(df.epic_child_eligible(open_me, policy, assignees))
+
+    def test_eligibility_applies_labels_when_configured(self):
+        policy = {"queue": {"assignees": ["alice"], "labels": ["dark-factory"], "match": "all"}}
+        issue = {
+            "state": "OPEN", "assignees": [], "labels": [{"name": "feature"}], "number": 1,
+        }
+        self.assertFalse(df.epic_child_eligible(issue, policy, ["alice"]))
+        issue["labels"] = [{"name": "dark-factory"}]
+        self.assertTrue(df.epic_child_eligible(issue, policy, ["alice"]))

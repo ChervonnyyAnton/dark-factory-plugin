@@ -219,6 +219,67 @@ def select_pinned_issue(run, policy, number):
     return issue
 
 
+_CHILD_RE = re.compile(r"#(\d+)\b")
+
+
+def discover_epic_child_numbers(run, epic):
+    numbers = []
+    seen = set()
+    repository = epic["repository"]
+    owner, name = repository.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){issue(number:$number){"
+        "trackedIssues(first:100){nodes{number}}}}}"
+    )
+    result = run([
+        "gh", "api", "graphql",
+        "-f", f"query={query}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+        "-F", f"number={epic['number']}",
+    ])
+    if getattr(result, "returncode", 0) == 0 and (result.stdout or "").strip():
+        try:
+            nodes = (
+                json.loads(result.stdout)
+                .get("data", {})
+                .get("repository", {})
+                .get("issue", {})
+                .get("trackedIssues", {})
+                .get("nodes", [])
+            )
+        except json.JSONDecodeError:
+            nodes = []
+        for node in nodes or []:
+            number = node.get("number")
+            if isinstance(number, int) and number not in seen:
+                seen.add(number)
+                numbers.append(number)
+    for match in _CHILD_RE.finditer(epic.get("body") or ""):
+        number = int(match.group(1))
+        if number == epic["number"] or number in seen:
+            continue
+        seen.add(number)
+        numbers.append(number)
+    return numbers
+
+
+def epic_child_eligible(issue, policy, assignees):
+    if str(issue.get("state", "")).upper() != "OPEN":
+        return False
+    logins = _assignee_logins(issue)
+    assignee_set = set(assignees)
+    if logins and not (logins & assignee_set):
+        return False
+    labels = policy.get("queue", {}).get("labels") or []
+    if labels:
+        issue_labels = {label.get("name") for label in issue.get("labels", [])}
+        if not (issue_labels & set(labels)):
+            return False
+    return True
+
+
 def reconcile(state, run, policy):
     reconciled = copy.deepcopy(state)
     current = reconciled["issue"]
