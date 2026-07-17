@@ -4,9 +4,11 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections import namedtuple
 from pathlib import Path
 from urllib.parse import urlparse
@@ -34,13 +36,66 @@ DEFAULT_STATE = {
     "project": None,
     "issue": None,
     "pr": None,
+    "pr_url": None,
+    "pr_title": None,
+    "pr_body": None,
     "branch": None,
     "head_sha": None,
+    "ci_checks": None,
+    "failed_check": None,
+    "merge_error": None,
+    "handoff_reason": None,
+    "waiting_for_capacity": False,
+    "testing": None,
+    "self_review": None,
+    "security_review": None,
     "attempts": {},
     "cooldowns": {},
     "next_wake_at": None,
     "updated_at": None,
 }
+
+# Delivery phase order and the role contract each phase runs. `ready_for_pr`
+# and `repairing` are handled by dedicated dispatch branches (they also talk
+# to GitHub) rather than the generic execution/judgement helpers below.
+PHASE_CONTRACTS = {
+    "planning": "planner",
+    "implementing": "implementer",
+    "testing": "tester",
+    "self_review": "reviewer",
+    "security_review": "security-reviewer",
+    "ready_for_pr": "pr-author",
+    "repairing": "repairer",
+}
+
+PHASE_PROVIDER_ROLE = {
+    "planning": "implement",
+    "implementing": "implement",
+    "testing": "review",
+    "self_review": "review",
+    "security_review": "review",
+    "ready_for_pr": "implement",
+    "repairing": "implement",
+}
+
+# Phase reached after a *passing* attempt. `ready_for_pr` is excluded: a
+# passing pr-author attempt stays in `ready_for_pr` until `open_pr` records a
+# pull request and advances to `ci_wait`.
+_NEXT_PHASE = {
+    "planning": "implementing",
+    "implementing": "testing",
+    "testing": "self_review",
+    "self_review": "security_review",
+    "security_review": "ready_for_pr",
+    "repairing": "ci_wait",
+}
+
+# Judgement phases require the role contract's structured pass/fail/blocked
+# verdict; a failure (or an unparseable verdict) loops back to `implementing`
+# within `limits.max_check_repairs`, then hands off.
+_JUDGEMENT_PHASES = ("testing", "self_review", "security_review")
+
+_TERMINAL_PHASES = ("merged", "handoff", "idle")
 
 
 def load_policy(root):
@@ -218,6 +273,356 @@ def run_provider(workspace, provider, prompt_file, run_id, *, max_turns):
         result_path,
         handoff_path,
     )
+
+
+def _json_result(result):
+    output = result.stdout if hasattr(result, "stdout") else result
+    if isinstance(output, bytes):
+        output = output.decode()
+    return json.loads(output)
+
+
+def _select_provider(policy, role):
+    providers = policy.get("providers", {}).get(role) or ["claude"]
+    return providers[0]
+
+
+def _extract_status(text):
+    """Return the last well-formed `{"status": "pass"|"fail"|"blocked", ...}`
+    object found in provider output, scanning line-by-line so surrounding
+    prose does not break parsing of the final structured verdict."""
+    status = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("status") in ("pass", "fail", "blocked"):
+            status = payload["status"]
+    return status
+
+
+def _parse_pr_title_and_body(text):
+    lines = text.strip().splitlines()
+    if not lines:
+        return "", ""
+    title = lines[0].lstrip("#").strip()
+    body = "\n".join(lines[1:]).strip()
+    return title, body
+
+
+def _ensure_closes(body, number):
+    marker = f"Closes #{number}"
+    body = (body or "").strip()
+    if marker in body:
+        return body
+    return marker if not body else f"{body}\n\n{marker}"
+
+
+def _run_phase_provider(workspace, state, policy, phase, run_provider_fn):
+    issue = state["issue"]
+    attempts = state.get("attempts", {})
+    prompt_path = build_phase_prompt(workspace, phase, issue, PHASE_CONTRACTS[phase])
+    provider = _select_provider(policy, PHASE_PROVIDER_ROLE[phase])
+    run_id = f"{issue['run_id']}-{phase}-{attempts.get(phase, 0)}"
+    max_turns = policy.get("limits", {}).get("max_turns", 40)
+    return run_provider_fn(workspace, provider, prompt_path, run_id, max_turns=max_turns)
+
+
+def _record_repair_or_handoff(state, phase, policy, reason):
+    attempts = state.setdefault("attempts", {})
+    attempts[phase] = int(attempts.get(phase, 0)) + 1
+    limit = policy.get("limits", {}).get("max_check_repairs", 5)
+    if attempts[phase] >= limit:
+        state["phase"] = "handoff"
+        state["handoff_reason"] = f"{reason} after {attempts[phase]} attempts"
+    else:
+        state["phase"] = "implementing"
+    return state
+
+
+def _advance_execution_phase(workspace, state, policy, phase, run_provider_fn):
+    """Run a non-judgement role contract (planner/implementer/pr-author/
+    repairer). Success advances to the next phase (or, for `ready_for_pr`,
+    records the drafted PR title/body for `open_pr` to consume). Failure
+    retries within `limits.max_check_repairs`, then hands off."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    attempt = _run_phase_provider(workspace, state, policy, phase, run_provider_fn)
+    if attempt.status == "success":
+        if phase == "ready_for_pr":
+            title, body = _parse_pr_title_and_body(attempt.stdout_path.read_text())
+            state["pr_title"] = title
+            state["pr_body"] = body
+            return state
+        state["phase"] = _NEXT_PHASE[phase]
+        return state
+    if attempt.status == "capacity_exhausted":
+        state["waiting_for_capacity"] = True
+        return state
+    return _record_repair_or_handoff(state, phase, policy, f"{phase} failed")
+
+
+def _advance_judgement_phase(workspace, state, policy, phase, run_provider_fn):
+    """Run a reviewer/tester/security-reviewer contract and act on its
+    structured verdict. `pass` advances; `fail`/`blocked`/unparseable output
+    loops back to `implementing` within budget, then hands off."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    attempt = _run_phase_provider(workspace, state, policy, phase, run_provider_fn)
+    if attempt.status == "capacity_exhausted":
+        state["waiting_for_capacity"] = True
+        return state
+    verdict = _extract_status(attempt.stdout_path.read_text()) if attempt.status == "success" else None
+    state[phase] = {"status": verdict, "provider_status": attempt.status, "run_dir": str(attempt.run_dir)}
+    if verdict == "pass":
+        state["phase"] = _NEXT_PHASE[phase]
+        return state
+    return _record_repair_or_handoff(state, phase, policy, f"{phase} did not pass")
+
+
+def open_pr(run, state):
+    """Create (or reuse) the pull request for the current issue/branch,
+    ensuring the body records `Closes #N`, and advance to `ci_wait`."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    issue = state["issue"]
+    repository = issue["repository"]
+    branch = state.get("branch")
+    if not branch:
+        raise ValueError("state must contain a factory branch")
+    number = issue["number"]
+    fields = "number,url,state,headRefOid,headRefName"
+
+    if state.get("pr"):
+        pr = _json_result(run(["gh", "pr", "view", str(state["pr"]), "--repo", repository, "--json", fields]))
+        if isinstance(pr, dict) and pr.get("state") == "OPEN" and pr.get("number") == state["pr"]:
+            state.update(
+                pr_url=pr.get("url", state.get("pr_url")),
+                head_sha=pr.get("headRefOid", state.get("head_sha")),
+                branch=pr.get("headRefName", branch),
+                phase="ci_wait",
+            )
+            return state
+
+    existing = _json_result(run(["gh", "pr", "list", "--repo", repository, "--head", branch, "--state", "open", "--json", fields]))
+    if isinstance(existing, list) and existing:
+        pr = existing[0]
+        state.update(
+            pr=pr["number"], pr_url=pr.get("url"), head_sha=pr.get("headRefOid"),
+            branch=pr.get("headRefName", branch), phase="ci_wait",
+        )
+        return state
+
+    title = state.get("pr_title") or f"Issue #{number}: {issue.get('title', '')}".rstrip(": ")
+    body = _ensure_closes(state.get("pr_body"), number)
+    created = run(["gh", "pr", "create", "--repo", repository, "--head", branch, "--title", title, "--body", body])
+    output = created.stdout if hasattr(created, "stdout") else str(created)
+    match = re.search(r"/pull/(\d+)", output)
+    if not match:
+        raise RuntimeError("gh pr create did not return a pull-request URL")
+    pr = _json_result(run(["gh", "pr", "view", match.group(1), "--repo", repository, "--json", fields]))
+    if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+        raise RuntimeError("gh pr view returned incomplete pull-request metadata")
+    state.update(
+        pr=pr["number"], pr_url=pr.get("url"), head_sha=pr.get("headRefOid"),
+        branch=pr.get("headRefName", branch), pr_title=title, pr_body=body, phase="ci_wait",
+    )
+    return state
+
+
+def _valid_checks(checks):
+    return isinstance(checks, list) and bool(checks) and all(
+        isinstance(check, dict)
+        and isinstance(check.get("name"), str) and check["name"]
+        and isinstance(check.get("bucket"), str)
+        for check in checks
+    )
+
+
+def _checks_green(checks):
+    return all(check["bucket"] in ("pass", "skipping") for check in checks)
+
+
+def _first_failed_check(checks):
+    return next(
+        (check["name"] for check in checks if check["bucket"] not in ("pass", "skipping", "pending")),
+        None,
+    )
+
+
+def repair_or_handoff(state, failed_check, policy):
+    """Record a failing check attempt; hand off once
+    `limits.max_check_repairs` (default 5) is reached, otherwise repair."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    key = f"ci:{failed_check}"
+    attempts = state.setdefault("attempts", {})
+    attempts[key] = int(attempts.get(key, 0)) + 1
+    limit = policy.get("limits", {}).get("max_check_repairs", 5)
+    state["failed_check"] = failed_check
+    if attempts[key] >= limit:
+        state["phase"] = "handoff"
+        state["handoff_reason"] = f"check '{failed_check}' failed {attempts[key]} times"
+    else:
+        state["phase"] = "repairing"
+    return state
+
+
+def watch_ci(run, state, policy):
+    """Poll PR checks once. Green leaves `ci_wait` with `ci_checks: green`
+    for the caller to make the merge/handoff decision; a failing check goes
+    through `repair_or_handoff`; pending/malformed checks stay in `ci_wait`."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    state["phase"] = "ci_wait"
+    issue = state["issue"]
+    repository = issue["repository"]
+    if state.get("pr") is None:
+        return state
+    result = run(["gh", "pr", "checks", str(state["pr"]), "--repo", repository, "--json", "name,state,bucket"])
+    try:
+        checks = _json_result(result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return repair_or_handoff(state, "malformed-ci", policy)
+    if not _valid_checks(checks):
+        return repair_or_handoff(state, "malformed-ci", policy)
+    if _checks_green(checks):
+        state["ci_checks"] = "green"
+        return state
+    failed = _first_failed_check(checks)
+    if failed is None:
+        state["ci_checks"] = "pending"
+        return state
+    return repair_or_handoff(state, failed, policy)
+
+
+def merge_ready(run, state):
+    """True only when every strict auto-merge gate is satisfied against
+    fresh GitHub evidence: recorded self/security review pass, an open PR
+    matching the controller-recorded head SHA, no outstanding requested
+    changes, and green required checks."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    if (state.get("self_review") or {}).get("status") != "pass":
+        return False
+    if (state.get("security_review") or {}).get("status") != "pass":
+        return False
+    issue = state.get("issue") or {}
+    repository = issue.get("repository")
+    if (
+        not repository
+        or not isinstance(state.get("pr"), int) or isinstance(state["pr"], bool) or state["pr"] <= 0
+        or not isinstance(state.get("pr_url"), str) or not state["pr_url"]
+        or not isinstance(state.get("head_sha"), str) or not state["head_sha"]
+    ):
+        return False
+    try:
+        pr = _json_result(run([
+            "gh", "pr", "view", str(state["pr"]), "--repo", repository,
+            "--json", "number,url,state,headRefOid,reviewDecision",
+        ]))
+        checks = _json_result(run([
+            "gh", "pr", "checks", str(state["pr"]), "--repo", repository,
+            "--json", "name,state,bucket",
+        ]))
+    except (KeyError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(pr, dict):
+        return False
+    return (
+        pr.get("state") == "OPEN"
+        and pr.get("number") == state["pr"]
+        and pr.get("headRefOid") == state["head_sha"]
+        and pr.get("reviewDecision") != "CHANGES_REQUESTED"
+        and _valid_checks(checks)
+        and _checks_green(checks)
+    )
+
+
+def merge_pr(run, state):
+    """Merge only when `merge_ready`; never force-push or bypass checks."""
+    state = copy.deepcopy(DEFAULT_STATE) | copy.deepcopy(state)
+    if not merge_ready(run, state):
+        return state
+    issue = state["issue"]
+    repository = issue["repository"]
+    result = run([
+        "gh", "pr", "merge", str(state["pr"]), "--repo", repository,
+        "--match-head-commit", state["head_sha"], "--squash", "--delete-branch",
+    ])
+    returncode = getattr(result, "returncode", 0)
+    output = getattr(result, "stdout", "") or ""
+    if returncode != 0 or any(marker in output.lower() for marker in ("error", "failed", "rejected")):
+        state["phase"] = "handoff"
+        state["merge_error"] = getattr(result, "stderr", "") or output or "gh pr merge failed"
+        return state
+    state["phase"] = "merged"
+    return state
+
+
+def _select_next_issue(run, policy):
+    return select_issue(list_matching_issues(run, policy))
+
+
+def _controller_iteration(store, run, *, run_provider_fn=run_provider):
+    """Advance persisted delivery state by exactly one step:
+    `planning -> implementing -> testing -> self_review -> security_review
+    -> ready_for_pr -> ci_wait -> repairing -> merged|handoff|idle`.
+
+    Returns True when the caller should iterate again, False once the
+    delivery reaches a terminal phase (`merged`, `handoff`, `idle`) or no
+    matching issue remains.
+    """
+    state = store.load()
+    workspace = store.path.parent.parent
+    policy = load_policy(workspace)
+
+    if state.get("issue") is None:
+        selected = _select_next_issue(run, policy)
+        if selected is None:
+            state["phase"] = "idle"
+            store.save(state)
+            return False
+        number = selected["number"]
+        selected = dict(selected, run_id=f"issue-{number}-{uuid.uuid4().hex[:8]}")
+        state.update(
+            issue=selected,
+            branch=f"dark-factory/issue-{number}",
+            phase="planning",
+            pr=None, pr_url=None, pr_title=None, pr_body=None, head_sha=None,
+            testing=None, self_review=None, security_review=None,
+            attempts={},
+        )
+        store.save(state)
+        return True
+
+    phase = state.get("phase")
+
+    if phase in ("planning", "implementing", "repairing"):
+        state = _advance_execution_phase(workspace, state, policy, phase, run_provider_fn)
+    elif phase in _JUDGEMENT_PHASES:
+        state = _advance_judgement_phase(workspace, state, policy, phase, run_provider_fn)
+    elif phase == "ready_for_pr":
+        if not state.get("pr_body"):
+            state = _advance_execution_phase(workspace, state, policy, phase, run_provider_fn)
+        if state.get("phase") == "ready_for_pr" and state.get("pr_body"):
+            state = open_pr(run, state)
+    elif phase == "ci_wait":
+        state = watch_ci(run, state, policy)
+        if state.get("phase") == "ci_wait" and state.get("ci_checks") == "green":
+            if policy.get("merge", {}).get("mode", "manual") == "auto":
+                if merge_ready(run, state):
+                    state = merge_pr(run, state)
+                else:
+                    state["phase"] = "handoff"
+                    state["handoff_reason"] = "auto merge gate not satisfied"
+            else:
+                state["phase"] = "handoff"
+                state["handoff_reason"] = "checks green; manual merge mode awaits human merge"
+    else:
+        store.save(state)
+        return False
+
+    store.save(state)
+    return state.get("phase") not in _TERMINAL_PHASES
 
 
 class StateStore:
