@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import copy
 import datetime as dt
 import fcntl
@@ -8,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections import namedtuple
 from pathlib import Path
@@ -716,6 +718,10 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
     matching issue remains.
     """
     state = store.load()
+    if state.get("requested") == "stop":
+        state["phase"] = "stopped"
+        store.save(state)
+        return False
     workspace = store.path.parent.parent
     policy = load_policy(workspace)
 
@@ -959,31 +965,228 @@ class ControllerLock:
         return True
 
 
+class StartGate:
+    def __init__(self, root):
+        self.path = Path(root) / ".dark-factory" / "start.lock"
+        self.held = False
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(
+                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+            )
+        except FileExistsError:
+            try:
+                pid = int(self.path.read_text().strip())
+                os.kill(pid, 0)
+            except (FileNotFoundError, ProcessLookupError, ValueError):
+                self.path.unlink(missing_ok=True)
+                return self.__enter__()
+            except PermissionError:
+                pass
+            raise RuntimeError("dark-factory controller start is already in progress")
+        try:
+            os.write(descriptor, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(descriptor)
+        self.held = True
+        return self
+
+    def __exit__(self, *unused):
+        if self.held:
+            self.path.unlink(missing_ok=True)
+            self.held = False
+
+
+def _state_for(root):
+    return StateStore(Path(root))
+
+
+def stop_controller(root):
+    store = _state_for(root)
+    state = store.load()
+    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    store.save(state, force_requested="stop")
+    return 0
+
+
+def monitor_controller(root):
+    state = _state_for(root).load()
+    wake = state.get("next_wake_at") or "none"
+    issue = state.get("issue")
+    issue_number = issue.get("number") if isinstance(issue, dict) else issue
+    output = (
+        f"{json.dumps(state, indent=2, sort_keys=True)}\n"
+        f"phase: {state.get('phase', 'idle')}; "
+        f"issue: {issue_number or 'none'}; next wake: {wake}"
+    )
+    print(output)
+    return output
+
+
+def _worker_command(root):
+    return [
+        str(Path(__file__).resolve()),
+        "run",
+        "--workspace",
+        str(Path(root).resolve()),
+    ]
+
+
+def start_controller(root, handshake_timeout=10):
+    root = Path(root).resolve()
+    if not (root / ".dark-factory" / "policy.json").is_file():
+        raise RuntimeError(f"missing policy: {root / '.dark-factory' / 'policy.json'}")
+    with StartGate(root):
+        store = _state_for(root)
+        state = store.load()
+        worker_pid = state.get("worker_pid")
+        worker_live = (
+            isinstance(worker_pid, int)
+            and not isinstance(worker_pid, bool)
+            and ControllerLock._pid_is_live(worker_pid)
+        )
+        if state.get("requested") in ("starting", "running") and worker_live:
+            raise RuntimeError("dark-factory controller is already running")
+        state.update(requested="starting", worker_pid=None, startup_error=None)
+        store.save(state, force_requested="starting")
+        process = subprocess.Popen(
+            _worker_command(root),
+            cwd=root,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + handshake_timeout
+        while time.monotonic() < deadline:
+            current = store.load()
+            if (
+                current.get("worker_pid") == process.pid
+                and current.get("requested") in ("running", "stop")
+            ):
+                return 0
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+        state = store.load()
+        state.update(
+            worker_pid=None,
+            startup_error="worker did not publish PID handshake",
+        )
+        store.save(state, force_requested="stopped")
+        raise RuntimeError("dark-factory worker failed to publish PID handshake")
+
+
+def run_controller(root):
+    root = Path(root).resolve()
+    store = _state_for(root)
+    with ControllerLock(root):
+        state = store.load()
+        if state.get("requested") == "stop":
+            state.update(worker_pid=os.getpid(), phase="stopped")
+            store.save(state)
+            return 0
+        state.update(
+            requested="running",
+            worker_pid=os.getpid(),
+            updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        store.save(state, force_requested="running")
+        while _controller_iteration(store, _gh_run):
+            if store.load().get("requested") == "stop":
+                continue
+    return 0
+
+
+def _gh_run(command):
+    return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def dry_run_controller(root, run=_gh_run):
+    root = Path(root).resolve()
+    policy = load_policy(root)
+    store = _state_for(root)
+    state = store.load()
+    issue = state.get("issue")
+    if not isinstance(issue, dict):
+        issue = select_issue(list_matching_issues(run, policy))
+        if issue is None:
+            state.update(
+                requested="stopped",
+                phase="idle",
+                dry_run_summary="dry-run: no eligible issue",
+            )
+            store.save(state, force_requested="stopped")
+            print(state["dry_run_summary"])
+            return 0
+        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
+    elif not issue.get("run_id"):
+        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
+    prompt = build_phase_prompt(root, "planning", issue, "planner")
+    summary = (
+        f"dry-run: selected issue #{issue['number']}; prepared {prompt}; "
+        "no provider, PR, or merge commands ran"
+    )
+    state.update(
+        requested="stopped",
+        phase="dry_run",
+        issue=issue,
+        dry_run_prompt=str(prompt),
+        dry_run_summary=summary,
+        updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+    )
+    store.save(state, force_requested="stopped")
+    print(summary)
+    return 0
+
+
 def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments:
-        return 0
-    if arguments[0] != "provider":
-        raise ValueError(f"unknown subcommand: {arguments[0]}")
-    if len(arguments) not in (5, 7):
-        raise ValueError(
-            "usage: dark-factory provider WORKSPACE PROVIDER PROMPT RUN_ID "
-            "[--max-turns N]"
+    if arguments and arguments[0] == "provider":
+        if len(arguments) not in (5, 7):
+            raise ValueError(
+                "usage: dark-factory provider WORKSPACE PROVIDER PROMPT RUN_ID "
+                "[--max-turns N]"
+            )
+        max_turns = 40
+        if len(arguments) == 7:
+            if arguments[5] != "--max-turns":
+                raise ValueError("expected --max-turns")
+            max_turns = int(arguments[6])
+        result = run_provider(
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            max_turns=max_turns,
         )
-    max_turns = 40
-    if len(arguments) == 7:
-        if arguments[5] != "--max-turns":
-            raise ValueError("expected --max-turns")
-        max_turns = int(arguments[6])
-    result = run_provider(
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-        max_turns=max_turns,
-    )
-    return result.returncode
+        return result.returncode
+
+    parser = argparse.ArgumentParser(prog="dark-factory")
+    parser.add_argument("action", choices=("start", "stop", "monitor", "run"))
+    parser.add_argument("--workspace", default=".")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(arguments)
+    if args.dry_run and args.action != "run":
+        parser.error("--dry-run is only valid with run")
+    root = Path(args.workspace).resolve()
+    if args.action == "start":
+        return start_controller(root)
+    if args.action == "stop":
+        return stop_controller(root)
+    if args.action == "monitor":
+        monitor_controller(root)
+        return 0
+    if args.dry_run:
+        return dry_run_controller(root)
+    return run_controller(root)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError) as error:
+        print(f"dark-factory: {error}", file=sys.stderr)
+        sys.exit(1)
