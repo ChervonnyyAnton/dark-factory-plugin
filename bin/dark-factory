@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+
+def load_policy(root):
+    return json.loads((Path(root) / ".dark-factory" / "policy.json").read_text())
+
+
+def resolve_assignees(policy, run):
+    raw = policy.get("queue", {}).get("assignees", [])
+    me_login = None
+    resolved = []
+    for assignee in raw:
+        if assignee == "@me":
+            if me_login is None:
+                result = run(["gh", "api", "user", "-q", ".login"])
+                me_login = result.stdout.strip()
+            resolved.append(me_login)
+        else:
+            resolved.append(assignee)
+    return resolved
+
+
+def issue_matches(issue, policy, assignees):
+    queue = policy.get("queue", {})
+    labels = queue.get("labels", [])
+    match_mode = queue.get("match", "any")
+
+    issue_logins = {a.get("login") for a in issue.get("assignees", [])}
+    issue_labels = {label.get("name") for label in issue.get("labels", [])}
+
+    assignee_match = bool(issue_logins & set(assignees))
+    label_match = bool(issue_labels & set(labels))
+
+    if match_mode == "all":
+        return assignee_match and label_match
+    return assignee_match or label_match
+
+
+def main(argv=None):
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
