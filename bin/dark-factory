@@ -344,7 +344,7 @@ def reconcile(state, run, policy):
     else:
         repository = reconciled["repository"]
         number = current
-    fields = "number,title,url,createdAt,assignees,labels"
+    fields = "number,title,url,createdAt,state,assignees,labels"
     result = run([
         "gh", "issue", "view", str(number),
         "--repo", repository,
@@ -355,7 +355,17 @@ def reconcile(state, run, policy):
         issue["run_id"] = current["run_id"]
     if isinstance(current, dict) and current.get("selection_intent"):
         issue["selection_intent"] = current["selection_intent"]
-    if not issue_matches(issue, policy, resolve_assignees(policy, run)):
+    assignees = resolve_assignees(policy, run)
+    is_epic_closure = issue.get("selection_intent") == "epic_closure"
+    is_pinned_issue = (reconciled.get("focus") or {}).get("issue") == number
+    if is_epic_closure or is_pinned_issue:
+        matches_policy = (
+            str(issue.get("state", "")).upper() == "OPEN"
+            and bool(_assignee_logins(issue) & set(assignees))
+        )
+    else:
+        matches_policy = issue_matches(issue, policy, assignees)
+    if not matches_policy:
         reconciled["phase"] = "paused"
     elif isinstance(current, dict):
         reconciled["issue"] = issue

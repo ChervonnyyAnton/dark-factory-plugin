@@ -132,7 +132,7 @@ class QueueTests(unittest.TestCase):
                 command,
                 [
                     "gh", "issue", "view", "3", "--repo", "org/repo",
-                    "--json", "number,title,url,createdAt,assignees,labels",
+                    "--json", "number,title,url,createdAt,state,assignees,labels",
                 ],
             )
             return Result(json.dumps({

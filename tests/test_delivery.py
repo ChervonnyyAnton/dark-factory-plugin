@@ -497,6 +497,64 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual(result["issue"]["selection_intent"], "epic_closure")
 
+    def test_epic_closure_without_queue_label_does_not_pause_under_all_match(self):
+        policy = {
+            **POLICY,
+            "queue": {
+                "assignees": ["alice"],
+                "labels": ["dark-factory"],
+                "match": "all",
+            },
+        }
+        state = base_state(issue={
+            **ISSUE,
+            "assignees": [{"login": "alice"}],
+            "labels": [],
+            "selection_intent": "epic_closure",
+        })
+
+        def run(command):
+            if command[:3] == ["gh", "issue", "view"]:
+                return Result(json.dumps({
+                    "number": 42, "title": "Ship widget",
+                    "url": "https://github.com/org/repo/issues/42",
+                    "createdAt": "2026-07-01T00:00:00Z", "state": "OPEN",
+                    "assignees": [{"login": "alice"}], "labels": [],
+                }))
+            raise AssertionError(f"unexpected command: {command}")
+
+        result = reconcile(state, run, policy)
+
+        self.assertNotEqual(result["phase"], "paused")
+
+    def test_pinned_issue_without_queue_label_does_not_pause_under_all_match(self):
+        policy = {
+            **POLICY,
+            "queue": {
+                "assignees": ["alice"],
+                "labels": ["dark-factory"],
+                "match": "all",
+            },
+        }
+        state = base_state(
+            issue={**ISSUE, "assignees": [{"login": "alice"}], "labels": []},
+            focus={"issue": 42},
+        )
+
+        def run(command):
+            if command[:3] == ["gh", "issue", "view"]:
+                return Result(json.dumps({
+                    "number": 42, "title": "Ship widget",
+                    "url": "https://github.com/org/repo/issues/42",
+                    "createdAt": "2026-07-01T00:00:00Z", "state": "OPEN",
+                    "assignees": [{"login": "alice"}], "labels": [],
+                }))
+            raise AssertionError(f"unexpected command: {command}")
+
+        result = reconcile(state, run, policy)
+
+        self.assertNotEqual(result["phase"], "paused")
+
 
 class ControllerIterationTests(unittest.TestCase):
     def _store(self, workspace, initial=None):
