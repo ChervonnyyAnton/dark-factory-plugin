@@ -1,0 +1,15 @@
+{
+  "description": "Continue active Dark Factory Ralph sessions",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop-ralph.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
