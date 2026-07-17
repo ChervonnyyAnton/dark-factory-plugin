@@ -280,6 +280,60 @@ def epic_child_eligible(issue, policy, assignees):
     return True
 
 
+def select_with_focus(run, policy, *, issue=None, epic=None):
+    if issue is not None and epic is not None:
+        raise ValueError("--issue and --epic are mutually exclusive")
+    if issue is not None:
+        selected = select_pinned_issue(run, policy, issue)
+        return selected, f"pinned issue #{selected['number']}"
+    if epic is None:
+        selected = select_issue(list_matching_issues(run, policy))
+        if selected is None:
+            return None, "no eligible issue"
+        return selected, f"queue selected issue #{selected['number']}"
+
+    epic_issue = resolve_issue(run, policy, epic)
+    assignees = resolve_assignees(policy, run)
+    if str(epic_issue.get("state", "")).upper() != "OPEN":
+        return None, f"epic #{epic} is already closed; nothing to deliver"
+    if not (_assignee_logins(epic_issue) & set(assignees)):
+        raise ValueError(f"epic #{epic} is not assigned to the policy assignees")
+
+    resolved = []
+    unresolved = []
+    for number in discover_epic_child_numbers(run, epic_issue):
+        try:
+            resolved.append(resolve_issue(run, policy, number))
+        except ValueError:
+            unresolved.append(number)
+
+    eligible = [
+        child for child in resolved
+        if epic_child_eligible(child, policy, assignees)
+    ]
+    if eligible:
+        selected = select_issue(eligible)
+        summary = f"epic #{epic} child #{selected['number']}"
+        if unresolved:
+            summary += f"; unresolved child refs ignored: {unresolved}"
+        return selected, summary
+
+    open_resolved = [
+        child for child in resolved
+        if str(child.get("state", "")).upper() == "OPEN"
+    ]
+    if open_resolved:
+        raise ValueError(
+            f"epic #{epic} has open children that are not eligible under policy"
+        )
+
+    selected = dict(epic_issue, selection_intent="epic_closure")
+    summary = f"epic #{epic} closure"
+    if unresolved:
+        summary += f"; unresolved child refs ignored: {unresolved}"
+    return selected, summary
+
+
 def reconcile(state, run, policy):
     reconciled = copy.deepcopy(state)
     current = reconciled["issue"]

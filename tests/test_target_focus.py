@@ -153,3 +153,100 @@ class EpicDiscoveryTests(unittest.TestCase):
         self.assertFalse(df.epic_child_eligible(issue, policy, ["alice"]))
         issue["labels"] = [{"name": "dark-factory"}]
         self.assertTrue(df.epic_child_eligible(issue, policy, ["alice"]))
+
+
+class SelectWithFocusTests(unittest.TestCase):
+    def _catalog(self):
+        return {
+            ("org/a", 56): {
+                "number": 56, "title": "epic", "url": "u",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "assignees": [{"login": "alice"}], "labels": [],
+                "state": "OPEN",
+                "body": "- [ ] #58\n- [ ] #59\n",
+            },
+            ("org/a", 58): {
+                "number": 58, "title": "older", "url": "u",
+                "createdAt": "2026-01-02T00:00:00Z",
+                "assignees": [], "labels": [], "state": "OPEN", "body": "",
+            },
+            ("org/a", 59): {
+                "number": 59, "title": "newer", "url": "u",
+                "createdAt": "2026-01-03T00:00:00Z",
+                "assignees": [], "labels": [], "state": "OPEN", "body": "",
+            },
+            ("org/a", 48): {
+                "number": 48, "title": "other", "url": "u",
+                "createdAt": "2025-01-01T00:00:00Z",
+                "assignees": [{"login": "alice"}], "labels": [],
+                "state": "OPEN", "body": "",
+            },
+        }
+
+    def _run_for(self, catalog, *, tracked=None):
+        tracked = tracked or []
+
+        def run(cmd):
+            if cmd[0:2] == ["gh", "api"] and "graphql" in " ".join(cmd):
+                nodes = [{"number": n} for n in tracked]
+                return Result(json.dumps({
+                    "data": {"repository": {"issue": {"trackedIssues": {"nodes": nodes}}}}
+                }))
+            if cmd[0:3] == ["gh", "issue", "view"]:
+                number = int(cmd[3])
+                repo = cmd[cmd.index("--repo") + 1]
+                payload = catalog.get((repo, number))
+                if payload is None:
+                    return Result("", returncode=1)
+                return Result(json.dumps(payload))
+            if cmd[0:3] == ["gh", "issue", "list"]:
+                repo = cmd[cmd.index("--repo") + 1]
+                issues = [
+                    {k: v for k, v in issue.items()}
+                    for (repository, _), issue in catalog.items()
+                    if repository == repo and str(issue.get("state", "")).upper() == "OPEN"
+                ]
+                return Result(json.dumps(issues))
+            raise AssertionError(cmd)
+
+        return run
+
+    def test_epic_selects_oldest_eligible_child(self):
+        catalog = self._catalog()
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        selected, summary = df.select_with_focus(
+            self._run_for(catalog), policy, epic=56,
+        )
+        self.assertEqual(selected["number"], 58)
+        self.assertIn("child #58", summary)
+
+    def test_epic_closure_when_all_resolved_children_closed(self):
+        catalog = self._catalog()
+        catalog[("org/a", 58)]["state"] = "CLOSED"
+        catalog[("org/a", 59)]["state"] = "CLOSED"
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        selected, summary = df.select_with_focus(
+            self._run_for(catalog), policy, epic=56,
+        )
+        self.assertEqual(selected["number"], 56)
+        self.assertEqual(selected.get("selection_intent"), "epic_closure")
+        self.assertIn("closure", summary)
+
+    def test_epic_already_closed_returns_none_without_queue_fallback(self):
+        catalog = self._catalog()
+        catalog[("org/a", 56)]["state"] = "CLOSED"
+        catalog[("org/a", 58)]["state"] = "CLOSED"
+        catalog[("org/a", 59)]["state"] = "CLOSED"
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        selected, summary = df.select_with_focus(
+            self._run_for(catalog), policy, epic=56,
+        )
+        self.assertIsNone(selected)
+        self.assertIn("already closed", summary)
+
+    def test_no_focus_uses_queue(self):
+        catalog = self._catalog()
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        selected, summary = df.select_with_focus(self._run_for(catalog), policy)
+        self.assertEqual(selected["number"], 48)
+        self.assertIn("queue selected", summary)
