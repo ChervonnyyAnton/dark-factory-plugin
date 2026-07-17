@@ -1,0 +1,20 @@
+{
+  "queue": {
+    "assignees": ["@me"],
+    "labels": ["dark-factory"],
+    "match": "any"
+  },
+  "repositories": ["owner/repo"],
+  "merge": { "mode": "manual" },
+  "providers": {
+    "implement": ["codex", "claude"],
+    "review": ["codex", "claude"],
+    "quota_domains": {}
+  },
+  "limits": {
+    "max_turns": 40,
+    "max_check_repairs": 5
+  },
+  "denied_commands": [],
+  "denied_paths": [".env", ".env.*", ".github/workflows"]
+}

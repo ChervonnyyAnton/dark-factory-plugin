@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.dark-factory/controller.json
+.dark-factory/controller.lock
+.dark-factory/runs/
+.DS_Store

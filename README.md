@@ -1,0 +1,49 @@
+# Dark Factory
+
+Portable Claude Code plugin for GitHub-backed Dark Factory workflows: a detached issue queue supervisor, delivery-team agents, and in-session Ralph loops.
+
+## Install
+
+### Local development
+
+From this repository:
+
+```bash
+claude --plugin-dir .
+```
+
+### Marketplace (later)
+
+A marketplace install path will be documented once the plugin is published. For now, clone this repo and use `--plugin-dir` as above.
+
+### Project policy
+
+Copy the policy template into your target project:
+
+```bash
+mkdir -p .dark-factory
+cp templates/policy.json .dark-factory/policy.json
+```
+
+Edit `.dark-factory/policy.json` for your queue filters, repositories, providers, and limits. Do not store secrets in policy.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/dark-factory` / `/dark-factory start` | Start the detached supervisor |
+| `/dark-factory-stop` | Request a graceful stop |
+| `/dark-factory-monitor` | Print durable controller JSON (phase, issue, wake) |
+| `/dark-factory-dry-run` | Discover/resume and prepare prompts without writes |
+| `/dark-factory:ralph …` | Start an in-session Ralph loop on one issue or task |
+| `/dark-factory:cancel` | Cancel an active Ralph Stop-loop |
+
+The `dark-factory` skill documents the same actions for non-slash invocation.
+
+## Tooling roadmap
+
+**v1 is Claude Code–first:** install via this plugin, commands, agents, and hooks. The supervisor, policy schema, queue/merge rules, and role contracts stay tool-agnostic so thin adapters for Codex, Cursor, Copilot, and similar CLIs can follow without rewriting the factory engine.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
