@@ -127,7 +127,7 @@ class ProviderTests(unittest.TestCase):
             prompt.write_text("Do the work")
 
             result = run_provider(
-                workspace, "codex", prompt, "run-3", max_turns=3
+                workspace, "claude", prompt, "run-3", max_turns=3
             )
 
             self.assertEqual(result.status, "capacity_exhausted")
@@ -147,7 +147,7 @@ class ProviderTests(unittest.TestCase):
             prompt.write_text("Do the work")
 
             returncode = dark_factory.main([
-                "provider", str(workspace), "codex", str(prompt), "run-4",
+                "provider", str(workspace), "claude", str(prompt), "run-4",
                 "--max-turns", "5",
             ])
 

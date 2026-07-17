@@ -7,9 +7,11 @@
   "repositories": ["owner/repo"],
   "merge": { "mode": "manual" },
   "providers": {
-    "implement": ["codex", "claude"],
-    "review": ["codex", "claude"],
-    "quota_domains": {}
+    "implement": ["claude"],
+    "review": ["claude"],
+    "quota_domains": {
+      "claude": "anthropic:personal"
+    }
   },
   "limits": {
     "max_turns": 40,

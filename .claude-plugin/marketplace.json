@@ -9,9 +9,9 @@
   "plugins": [
     {
       "name": "dark-factory",
-      "description": "Portable Dark Factory: detached issue queue, delivery-team agents, and Ralph session loops.",
+      "description": "Portable Dark Factory: detached issue queue, delivery-team agents, and Ralph session loops (Claude-only providers).",
       "source": "./",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "category": "development",
       "homepage": "https://github.com/ChervonnyyAnton/dark-factory-plugin"
     }

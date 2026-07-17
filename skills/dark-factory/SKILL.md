@@ -20,5 +20,6 @@ Optional targeting (mutually exclusive):
 Slash commands forward `$ARGUMENTS` unchanged, for example `/dark-factory start --epic 56` or `/dark-factory-dry-run --issue 58`.
 
 Starting requires `.dark-factory/policy.json` and grants the detached controller
-the policy-defined delivery authority. Stop preserves controller state and
+the policy-defined delivery authority. Providers are Claude-only for now
+(`implement` / `review`: `["claude"]`). Stop preserves controller state and
 evidence so a later start can resume.

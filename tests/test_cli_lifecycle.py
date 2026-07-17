@@ -130,7 +130,7 @@ class LifecycleTests(unittest.TestCase):
                 "repositories": ["org/a"],
                 "queue": {"assignees": ["alice"], "labels": []},
                 "merge": {"mode": "manual"},
-                "providers": {"implement": ["codex"], "review": ["codex"]},
+                "providers": {"implement": ["claude"], "review": ["claude"]},
             }))
             catalog = {
                 ("org/a", 56): {

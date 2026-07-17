@@ -46,7 +46,9 @@ mkdir -p .dark-factory
 cp templates/policy.json .dark-factory/policy.json
 ```
 
-Edit `.dark-factory/policy.json` for your queue filters, repositories, providers, and limits. Do not store secrets in policy.
+Edit `.dark-factory/policy.json` for your queue filters, repositories, and limits.
+Providers are **Claude-only** for now (`implement` / `review`: `["claude"]`).
+Do not store secrets in policy.
 
 The safety hook always blocks `git push --force` and `git reset --hard`. It also
 blocks tool access to `denied_paths`; without a readable policy it falls back to
@@ -77,9 +79,9 @@ under `.dark-factory/runs/` from the supervisor's final state.
 
 The `dark-factory` skill documents the same actions for non-slash invocation.
 
-## Tooling roadmap
+## Providers
 
-**v1 is Claude Code–first:** install via this plugin, commands, agents, and hooks. The supervisor, policy schema, queue/merge rules, and role contracts stay tool-agnostic so thin adapters for Codex, Cursor, Copilot, and similar CLIs can follow without rewriting the factory engine.
+**Claude-only for now.** The supervisor invokes `claude -p --dangerously-skip-permissions` for implement and review roles. Other CLIs (Codex, Cursor, Copilot, …) are intentionally not wired; the policy schema can grow later without rewriting the factory engine.
 
 ## License
 

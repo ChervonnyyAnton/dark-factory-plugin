@@ -17,14 +17,9 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Claude-only for now. Other CLI providers stay off the map until re-enabled.
 PROVIDERS = {
     "claude": ("claude", "-p", "--dangerously-skip-permissions"),
-    "codex": (
-        "codex",
-        "exec",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-",
-    ),
 }
 AttemptResult = namedtuple(
     "AttemptResult",

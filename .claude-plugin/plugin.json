@@ -1,8 +1,8 @@
 {
   "name": "dark-factory",
   "displayName": "Dark Factory",
-  "version": "0.1.1",
-  "description": "Portable Dark Factory: detached issue queue, delivery-team agents, and Ralph session loops.",
+  "version": "0.1.2",
+  "description": "Portable Dark Factory: detached issue queue, delivery-team agents, and Ralph session loops (Claude-only providers).",
   "author": { "name": "ChervonnyyAnton" },
   "keywords": ["dark-factory", "ralph", "agents", "github"]
 }
