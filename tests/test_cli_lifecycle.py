@@ -110,6 +110,57 @@ class LifecycleTests(unittest.TestCase):
                 ["gh", "pr", "create"], ["gh", "pr", "merge"],
             ) for command in commands))
 
+    def test_main_rejects_issue_and_epic_together(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            with self.assertRaises(SystemExit):
+                dark_factory.main([
+                    "run", "--dry-run", "--issue", "1", "--epic", "2",
+                    "--workspace", workspace,
+                ])
+
+    def test_worker_command_includes_epic(self):
+        command = dark_factory._worker_command(Path("/tmp/ws"), epic=56)
+        self.assertEqual(command[-2:], ["--epic", "56"])
+
+    def test_dry_run_with_epic_selects_child(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            (root / ".dark-factory").mkdir()
+            (root / ".dark-factory" / "policy.json").write_text(json.dumps({
+                "repositories": ["org/a"],
+                "queue": {"assignees": ["alice"], "labels": []},
+                "merge": {"mode": "manual"},
+                "providers": {"implement": ["codex"], "review": ["codex"]},
+            }))
+            catalog = {
+                ("org/a", 56): {
+                    "number": 56, "title": "epic", "url": "u",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "assignees": [{"login": "alice"}], "labels": [],
+                    "state": "OPEN", "body": "#58\n",
+                },
+                ("org/a", 58): {
+                    "number": 58, "title": "child", "url": "u",
+                    "createdAt": "2026-01-02T00:00:00Z",
+                    "assignees": [], "labels": [], "state": "OPEN", "body": "",
+                },
+            }
+
+            def run(command):
+                if command[:2] == ["gh", "api"]:
+                    return Result(json.dumps({
+                        "data": {"repository": {"issue": {"trackedIssues": {"nodes": []}}}}
+                    }))
+                if command[:3] == ["gh", "issue", "view"]:
+                    number = int(command[3])
+                    repository = command[command.index("--repo") + 1]
+                    return Result(json.dumps(catalog[(repository, number)]))
+                raise AssertionError(command)
+
+            self.assertEqual(dark_factory.dry_run_controller(root, run=run, epic=56), 0)
+            state = json.loads((root / ".dark-factory" / "controller.json").read_text())
+            self.assertEqual(state["issue"]["number"], 58)
+
     def test_start_refuses_workspace_without_policy(self):
         with tempfile.TemporaryDirectory() as workspace:
             with self.assertRaisesRegex(RuntimeError, "missing policy"):

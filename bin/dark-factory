@@ -37,6 +37,7 @@ DEFAULT_STATE = {
     "phase": "idle",
     "project": None,
     "issue": None,
+    "focus": None,
     "pr": None,
     "pr_url": None,
     "pr_title": None,
@@ -882,8 +883,16 @@ def merge_pr(run, state):
     return state
 
 
-def _select_next_issue(run, policy):
-    return select_issue(list_matching_issues(run, policy))
+def _focus_dict(issue=None, epic=None):
+    if issue is not None:
+        return {"issue": issue}
+    if epic is not None:
+        return {"epic": epic}
+    return None
+
+
+def _select_next_issue(run, policy, focus=None):
+    return select_with_focus(run, policy, **(focus or {}))[0]
 
 
 def _controller_iteration(store, run, *, run_provider_fn=run_provider):
@@ -904,7 +913,7 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
     policy = load_policy(workspace)
 
     if state.get("issue") is None:
-        selected = _select_next_issue(run, policy)
+        selected = _select_next_issue(run, policy, state.get("focus"))
         if selected is None:
             state["phase"] = "idle"
             store.save(state)
@@ -1205,16 +1214,21 @@ def monitor_controller(root):
     return output
 
 
-def _worker_command(root):
-    return [
+def _worker_command(root, issue=None, epic=None):
+    command = [
         str(Path(__file__).resolve()),
         "run",
         "--workspace",
         str(Path(root).resolve()),
     ]
+    if issue is not None:
+        command.extend(["--issue", str(issue)])
+    if epic is not None:
+        command.extend(["--epic", str(epic)])
+    return command
 
 
-def start_controller(root, handshake_timeout=10):
+def start_controller(root, handshake_timeout=10, issue=None, epic=None):
     root = Path(root).resolve()
     if not (root / ".dark-factory" / "policy.json").is_file():
         raise RuntimeError(f"missing policy: {root / '.dark-factory' / 'policy.json'}")
@@ -1229,10 +1243,15 @@ def start_controller(root, handshake_timeout=10):
         )
         if state.get("requested") in ("starting", "running") and worker_live:
             raise RuntimeError("dark-factory controller is already running")
-        state.update(requested="starting", worker_pid=None, startup_error=None)
+        state.update(
+            requested="starting",
+            worker_pid=None,
+            startup_error=None,
+            focus=_focus_dict(issue, epic),
+        )
         store.save(state, force_requested="starting")
         process = subprocess.Popen(
-            _worker_command(root),
+            _worker_command(root, issue=issue, epic=epic),
             cwd=root,
             start_new_session=True,
             stdin=subprocess.DEVNULL,
@@ -1259,7 +1278,7 @@ def start_controller(root, handshake_timeout=10):
         raise RuntimeError("dark-factory worker failed to publish PID handshake")
 
 
-def run_controller(root):
+def run_controller(root, issue=None, epic=None):
     root = Path(root).resolve()
     store = _state_for(root)
     with ControllerLock(root):
@@ -1271,6 +1290,7 @@ def run_controller(root):
         state.update(
             requested="running",
             worker_pid=os.getpid(),
+            focus=_focus_dict(issue, epic),
             updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         )
         store.save(state, force_requested="running")
@@ -1284,35 +1304,39 @@ def _gh_run(command):
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def dry_run_controller(root, run=_gh_run):
+def dry_run_controller(root, run=_gh_run, issue=None, epic=None):
     root = Path(root).resolve()
     policy = load_policy(root)
     store = _state_for(root)
     state = store.load()
-    issue = state.get("issue")
-    if not isinstance(issue, dict):
-        issue = select_issue(list_matching_issues(run, policy))
-        if issue is None:
-            state.update(
-                requested="stopped",
-                phase="idle",
-                dry_run_summary="dry-run: no eligible issue",
-            )
-            store.save(state, force_requested="stopped")
-            print(state["dry_run_summary"])
-            return 0
-        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
-    elif not issue.get("run_id"):
-        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
-    prompt = build_phase_prompt(root, "planning", issue, "planner")
+    selected, selection_summary = select_with_focus(
+        run, policy, issue=issue, epic=epic,
+    )
+    focus = _focus_dict(issue, epic)
+    if selected is None:
+        state.update(
+            requested="stopped",
+            phase="idle",
+            issue=None,
+            focus=focus,
+            dry_run_summary=f"dry-run: {selection_summary}",
+            dry_run_prompt=None,
+            updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        store.save(state, force_requested="stopped")
+        print(state["dry_run_summary"])
+        return 0
+    selected = dict(selected, run_id=f"dry-run-{selected['number']}-{uuid.uuid4().hex[:8]}")
+    prompt = build_phase_prompt(root, "planning", selected, "planner")
     summary = (
-        f"dry-run: selected issue #{issue['number']}; prepared {prompt}; "
+        f"dry-run: {selection_summary}; prepared {prompt}; "
         "no provider, PR, or merge commands ran"
     )
     state.update(
         requested="stopped",
         phase="dry_run",
-        issue=issue,
+        issue=selected,
+        focus=focus,
         dry_run_prompt=str(prompt),
         dry_run_summary=summary,
         updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1348,20 +1372,26 @@ def main(argv=None):
     parser.add_argument("action", choices=("start", "stop", "monitor", "run"))
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--issue", type=int)
+    parser.add_argument("--epic", type=int)
     args = parser.parse_args(arguments)
     if args.dry_run and args.action != "run":
         parser.error("--dry-run is only valid with run")
+    if args.issue is not None and args.epic is not None:
+        parser.error("--issue and --epic are mutually exclusive")
+    if (args.issue is not None or args.epic is not None) and args.action not in ("start", "run"):
+        parser.error("--issue/--epic are only valid with start or run")
     root = Path(args.workspace).resolve()
     if args.action == "start":
-        return start_controller(root)
+        return start_controller(root, issue=args.issue, epic=args.epic)
     if args.action == "stop":
         return stop_controller(root)
     if args.action == "monitor":
         monitor_controller(root)
         return 0
     if args.dry_run:
-        return dry_run_controller(root)
-    return run_controller(root)
+        return dry_run_controller(root, issue=args.issue, epic=args.epic)
+    return run_controller(root, issue=args.issue, epic=args.epic)
 
 
 if __name__ == "__main__":
