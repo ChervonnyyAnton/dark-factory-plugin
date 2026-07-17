@@ -4,17 +4,18 @@ Portable Claude Code plugin for GitHub-backed Dark Factory workflows: a detached
 
 ## Install
 
+### Plugin manager
+
+In Claude Code, run `/plugins`, add the marketplace that contains Dark Factory,
+then install the `dark-factory` plugin.
+
 ### Local development
 
-From this repository:
+Run directly from a local checkout:
 
 ```bash
-claude --plugin-dir .
+claude --plugin-dir /path/to/dark-factory-plugin
 ```
-
-### Marketplace (later)
-
-A marketplace install path will be documented once the plugin is published. For now, clone this repo and use `--plugin-dir` as above.
 
 ### Project policy
 
@@ -26,6 +27,10 @@ cp templates/policy.json .dark-factory/policy.json
 ```
 
 Edit `.dark-factory/policy.json` for your queue filters, repositories, providers, and limits. Do not store secrets in policy.
+
+The safety hook always blocks `git push --force` and `git reset --hard`. It also
+blocks tool access to `denied_paths`; without a readable policy it falls back to
+`.env`, `.env.*`, and `.github/workflows`.
 
 ## Commands
 

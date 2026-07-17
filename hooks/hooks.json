@@ -1,6 +1,16 @@
 {
-  "description": "Continue active Dark Factory Ralph sessions",
+  "description": "Enforce Dark Factory safety policy and continue active Ralph sessions",
   "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pretool-safety.sh\""
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
