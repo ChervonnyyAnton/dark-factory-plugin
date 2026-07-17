@@ -4,10 +4,30 @@ Portable Claude Code plugin for GitHub-backed Dark Factory workflows: a detached
 
 ## Install
 
-### Plugin manager
+This repository is both the plugin and a single-plugin marketplace
+(`.claude-plugin/marketplace.json`).
 
-In Claude Code, run `/plugins`, add the marketplace that contains Dark Factory,
-then install the `dark-factory` plugin.
+### Marketplace (recommended)
+
+CLI:
+
+```bash
+claude plugin marketplace add ChervonnyyAnton/dark-factory-plugin
+claude plugin install dark-factory@dark-factory-plugin --scope user
+```
+
+Or in Claude Code UI: `/plugins` → **Marketplaces** → **Add** →
+`ChervonnyyAnton/dark-factory-plugin`, then install `dark-factory` from
+**Discover**.
+
+Update later with:
+
+```bash
+claude plugin marketplace update dark-factory-plugin
+claude plugin update dark-factory@dark-factory-plugin
+```
+
+Or **Installed** → **Update now**.
 
 ### Local development
 
