@@ -45,6 +45,35 @@ class SafetyHookTests(unittest.TestCase):
 
             self.assert_denied(result)
 
+    def test_blocks_force_push_shell_continuations(self):
+        commands = (
+            "git push origin main --force;",
+            "git push origin main --force && echo ok",
+            "git push origin main --force | tee /tmp/log",
+            "git push origin main --force\n",
+            "git push origin main -f;",
+            "git push\norigin main --force",
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            for command in commands:
+                with self.subTest(command=command):
+                    result = self.run_hook(workspace, "Bash", {"command": command})
+                    self.assert_denied(result)
+
+    def test_blocks_hard_reset_shell_continuations(self):
+        commands = (
+            "git reset HEAD~1 --hard;",
+            "git reset HEAD~1 --hard && git status",
+            "git reset HEAD~1 --hard | tee /tmp/log",
+            "git reset HEAD~1 --hard\n",
+            "git reset\nHEAD~1 --hard",
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            for command in commands:
+                with self.subTest(command=command):
+                    result = self.run_hook(workspace, "Bash", {"command": command})
+                    self.assert_denied(result)
+
     def test_allows_safe_git_command(self):
         with tempfile.TemporaryDirectory() as workspace:
             result = self.run_hook(
@@ -70,7 +99,7 @@ class SafetyHookTests(unittest.TestCase):
 
             self.assert_denied(result)
 
-    def test_reads_additional_denied_paths_from_policy(self):
+    def test_policy_denied_paths_block_matching_files(self):
         with tempfile.TemporaryDirectory() as workspace:
             policy_directory = Path(workspace) / ".dark-factory"
             policy_directory.mkdir()

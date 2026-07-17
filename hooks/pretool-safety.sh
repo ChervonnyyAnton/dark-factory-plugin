@@ -40,9 +40,10 @@ except (OSError, ValueError):
 
 command = tool_input.get("command", "")
 if hook.get("tool_name") == "Bash" and isinstance(command, str):
+    dangerous_suffix = r"(?=[\s;&|]|$|\n)"
     dangerous = (
-        r"\bgit\s+push\b[^;&\n]*(?:--force(?:=true)?|-f)(?=\s|$)",
-        r"\bgit\s+reset\b[^;&\n]*--hard(?=\s|$)",
+        rf"\bgit\s+push\b[^;&|]*(?:--force(?:=true)?|-f){dangerous_suffix}",
+        rf"\bgit\s+reset\b[^;&|]*--hard{dangerous_suffix}",
     )
     denied_commands = policy.get("denied_commands", [])
     if any(re.search(pattern, command) for pattern in dangerous) or (
