@@ -250,3 +250,26 @@ class SelectWithFocusTests(unittest.TestCase):
         selected, summary = df.select_with_focus(self._run_for(catalog), policy)
         self.assertEqual(selected["number"], 48)
         self.assertIn("queue selected", summary)
+
+    def test_issue_and_epic_mutually_exclusive(self):
+        catalog = self._catalog()
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            df.select_with_focus(
+                self._run_for(catalog), policy, issue=58, epic=56,
+            )
+
+    def test_epic_ignores_unresolved_child_refs_for_closure(self):
+        catalog = self._catalog()
+        catalog[("org/a", 56)]["body"] = "- [ ] #58\n- [ ] #59\n- [ ] #999\n"
+        catalog[("org/a", 58)]["state"] = "CLOSED"
+        catalog[("org/a", 59)]["state"] = "CLOSED"
+        policy = {"repositories": ["org/a"], "queue": {"assignees": ["alice"], "labels": []}}
+        selected, summary = df.select_with_focus(
+            self._run_for(catalog), policy, epic=56,
+        )
+        self.assertEqual(selected["number"], 56)
+        self.assertEqual(selected.get("selection_intent"), "epic_closure")
+        self.assertIn("closure", summary)
+        self.assertIn("unresolved child refs ignored", summary)
+        self.assertIn("999", summary)
