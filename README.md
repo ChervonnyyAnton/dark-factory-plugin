@@ -32,6 +32,13 @@ The safety hook always blocks `git push --force` and `git reset --hard`. It also
 blocks tool access to `denied_paths`; without a readable policy it falls back to
 `.env`, `.env.*`, and `.github/workflows`.
 
+### Merge and handoff
+
+The supervisor's merge gate is deterministic: provider output cannot make a
+pull request merge-ready or override failed gate evidence. On manual handoff or
+after a verified merge, the factory releaser authors the human-facing note
+under `.dark-factory/runs/` from the supervisor's final state.
+
 ## Commands
 
 | Command | Description |

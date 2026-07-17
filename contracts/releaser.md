@@ -9,12 +9,14 @@ Enforce the configured merge policy and produce either a verified auto-merge dec
 - In `auto` mode, confirm every strict merge gate against fresh evidence.
 - In `manual` mode, stop before merge and prepare a human-readable handoff.
 - Fail closed when required checks, review state, head SHA, queue eligibility, or recorded verification is uncertain.
+- Treat the supplied deterministic delivery state as authoritative; do not override its merge decision.
 
 ## Required output
 
 - Merge mode and `ready`, `not_ready`, or `handoff` status.
 - Evidence for each required gate.
 - For manual mode or a failed gate, the exact human action or blocker.
+- A concise human-facing handoff or completion note.
 
 ## Forbidden actions
 

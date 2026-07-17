@@ -26,6 +26,12 @@ class ContractTests(unittest.TestCase):
                 for heading in HEADINGS:
                     self.assertIn(f"## {heading}", lines)
 
+    def test_judgement_contracts_require_a_compact_json_verdict(self):
+        for role in ("tester", "reviewer", "security-reviewer"):
+            with self.subTest(role=role):
+                text = (ROOT / "contracts" / f"{role}.md").read_text()
+                self.assertIn("single-line compact JSON verdict object", text)
+
 
 if __name__ == "__main__":
     unittest.main()

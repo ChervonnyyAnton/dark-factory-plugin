@@ -47,6 +47,7 @@ DEFAULT_STATE = {
     "failed_check": None,
     "merge_error": None,
     "handoff_reason": None,
+    "release_note": None,
     "waiting_for_capacity": False,
     "testing": None,
     "self_review": None,
@@ -68,6 +69,7 @@ PHASE_CONTRACTS = {
     "security_review": "security-reviewer",
     "ready_for_pr": "pr-author",
     "repairing": "repairer",
+    "releaser": "releaser",
 }
 
 PHASE_PROVIDER_ROLE = {
@@ -78,6 +80,7 @@ PHASE_PROVIDER_ROLE = {
     "security_review": "review",
     "ready_for_pr": "implement",
     "repairing": "implement",
+    "releaser": "review",
 }
 
 # Phase reached after a *passing* attempt. `ready_for_pr` is excluded: a
@@ -195,6 +198,8 @@ def reconcile(state, run, policy):
         "--json", fields,
     ])
     issue = dict(json.loads(result.stdout), repository=repository)
+    if isinstance(current, dict) and current.get("run_id"):
+        issue["run_id"] = current["run_id"]
     if not issue_matches(issue, policy, resolve_assignees(policy, run)):
         reconciled["phase"] = "paused"
     elif isinstance(current, dict):
@@ -262,6 +267,13 @@ def build_phase_prompt(workspace, phase, issue, contract_name, *, state=None):
         context = _repair_context_block(state)
         if context:
             text = f"{text.rstrip()}\n\n{context}\n"
+    elif phase == "releaser" and state:
+        text = (
+            f"{text.rstrip()}\n\n# Deterministic delivery state\n\n"
+            "Author the human-facing handoff note from this state. Do not alter "
+            "or reinterpret its merge decision.\n\n"
+            f"```json\n{json.dumps(state, indent=2, sort_keys=True)}\n```\n"
+        )
     prompt_path.write_text(text)
     return prompt_path
 
@@ -338,15 +350,13 @@ def _select_provider(policy, role):
 
 def _extract_status(text):
     """Return the last well-formed `{"status": "pass"|"fail"|"blocked", ...}`
-    object found in provider output, scanning line-by-line so surrounding
-    prose does not break parsing of the final structured verdict."""
+    object found in provider output, including pretty-printed JSON surrounded
+    by prose."""
     status = None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
         try:
-            payload = json.loads(line)
+            payload, _ = decoder.raw_decode(text, match.start())
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict) and payload.get("status") in ("pass", "fail", "blocked"):
@@ -455,6 +465,19 @@ def _advance_judgement_phase(workspace, state, policy, phase, run_provider_fn):
         state["phase"] = _NEXT_PHASE[phase]
         return state
     return _record_repair_or_handoff(state, phase, policy, f"{phase} did not pass")
+
+
+def _author_release_note(workspace, state, policy, run_provider_fn):
+    """Invoke the releaser for prose only; deterministic state remains authoritative."""
+    attempt = _run_phase_provider(
+        workspace, state, policy, "releaser", run_provider_fn,
+    )
+    state["release_note"] = {
+        "provider_status": attempt.status,
+        "run_dir": str(attempt.run_dir),
+        "path": str(attempt.handoff_path),
+    }
+    return state
 
 
 def push_branch(run, workspace, branch):
@@ -777,6 +800,8 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
         store.save(state)
         return False
 
+    if state.get("phase") in ("handoff", "merged") and state.get("phase") != phase:
+        state = _author_release_note(workspace, state, policy, run_provider_fn)
     store.save(state)
     return state.get("phase") not in _TERMINAL_PHASES
 

@@ -12,6 +12,7 @@ Assess the implementation for secrets exposure, authorization flaws, injection, 
 
 ## Required output
 
+- End with a single-line compact JSON verdict object containing `status`: `pass`, `fail`, or `blocked`.
 - Overall `pass`, `fail`, or `blocked` status.
 - Findings with severity, location, impact, evidence, and remediation.
 - An explicit statement when no security findings are identified.

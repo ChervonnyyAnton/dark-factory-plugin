@@ -12,6 +12,7 @@ Provide fresh pass or fail evidence from the smallest native verification that c
 
 ## Required output
 
+- End with a single-line compact JSON verdict object containing `status`: `pass`, `fail`, or `blocked`.
 - Overall `pass`, `fail`, or `blocked` status.
 - Commands run and concise output evidence.
 - For each failure, the failing check and actionable diagnostic details.

@@ -22,6 +22,7 @@ merge_ready = dark_factory.merge_ready
 merge_pr = dark_factory.merge_pr
 repair_or_handoff = dark_factory.repair_or_handoff
 reconcile = dark_factory.reconcile
+_extract_status = dark_factory._extract_status
 _review_threads = dark_factory._review_threads
 _controller_iteration = dark_factory._controller_iteration
 StateStore = dark_factory.StateStore
@@ -305,6 +306,19 @@ class RepairOrHandoffTests(unittest.TestCase):
         self.assertEqual(state["phase"], "handoff")
 
 
+class ExtractStatusTests(unittest.TestCase):
+    def test_extracts_status_from_pretty_printed_json_amid_prose(self):
+        output = """Verification complete.
+{
+  "status": "pass",
+  "summary": "All checks passed"
+}
+End of report.
+"""
+
+        self.assertEqual(_extract_status(output), "pass")
+
+
 def ready_state(**overrides):
     state = base_state(
         pr=7,
@@ -479,6 +493,16 @@ class ControllerIterationTests(unittest.TestCase):
         stdout_path.write_text(stdout)
         return dark_factory.AttemptResult(status, 0, run_dir, stdout_path, run_dir / "stderr.txt", run_dir / "result.json", run_dir / "handoff.md")
 
+    def _release_provider(self, workspace):
+        def provider(*args, **kwargs):
+            attempt = self._attempt(
+                workspace, "success", stdout="Human-facing release note.\n",
+                run_dir_name=args[3],
+            )
+            attempt.handoff_path.write_text(attempt.stdout_path.read_text())
+            return attempt
+        return provider
+
     def test_selects_issue_and_enters_planning_when_none_selected(self):
         with tempfile.TemporaryDirectory() as workspace:
             store = self._store(workspace)
@@ -650,6 +674,7 @@ class ControllerIterationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workspace:
             store = self._store(workspace, ready_state(phase="ci_wait"))
             commands = []
+            captured = {}
 
             def run(command):
                 commands.append(command)
@@ -657,11 +682,19 @@ class ControllerIterationTests(unittest.TestCase):
                     return Result(json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass"}]))
                 raise AssertionError(f"unexpected command: {command}")
 
-            continued = _controller_iteration(store, run)
+            def provider_fn(w, provider, prompt_path, run_id, max_turns):
+                captured["prompt"] = Path(prompt_path).read_text()
+                attempt = self._attempt(workspace, "success", stdout="Ready for human merge.\n", run_dir_name=run_id)
+                attempt.handoff_path.write_text(attempt.stdout_path.read_text())
+                return attempt
+
+            continued = _controller_iteration(store, run, run_provider_fn=provider_fn)
 
             state = store.load()
             self.assertFalse(continued)
             self.assertEqual(state["phase"], "handoff")
+            self.assertIn("# Factory Releaser", captured["prompt"])
+            self.assertEqual(Path(state["release_note"]["path"]).read_text(), "Ready for human merge.\n")
             self.assertNotIn(["gh", "pr", "merge"], [c[:3] for c in commands])
 
     def _matching_issue_view_result(self):
@@ -695,7 +728,9 @@ class ControllerIterationTests(unittest.TestCase):
                     return Result("Merged\n")
                 raise AssertionError(f"unexpected command: {command}")
 
-            continued = _controller_iteration(store, run)
+            continued = _controller_iteration(
+                store, run, run_provider_fn=self._release_provider(workspace),
+            )
 
             state = store.load()
             self.assertFalse(continued)
@@ -725,7 +760,9 @@ class ControllerIterationTests(unittest.TestCase):
                     return Result(graphql_review_threads_payload())
                 raise AssertionError(f"unexpected command: {command}")
 
-            continued = _controller_iteration(store, run)
+            continued = _controller_iteration(
+                store, run, run_provider_fn=self._release_provider(workspace),
+            )
 
             state = store.load()
             self.assertFalse(continued)
@@ -771,7 +808,9 @@ class ControllerIterationTests(unittest.TestCase):
                     return Result(json.dumps([{"name": "unit-tests", "state": "FAILURE", "bucket": "fail"}]))
                 raise AssertionError(f"unexpected command: {command}")
 
-            continued = _controller_iteration(store, run)
+            continued = _controller_iteration(
+                store, run, run_provider_fn=self._release_provider(workspace),
+            )
 
             state = store.load()
             self.assertFalse(continued)
@@ -809,6 +848,7 @@ class ControllerIterationTests(unittest.TestCase):
                     "# Factory Security Reviewer": '{"status": "pass"}\n',
                     "# Factory Reviewer": '{"status": "pass"}\n',
                     "# Factory PR Author": "Ship widget\n\nImplements the widget end to end.\n",
+                    "# Factory Releaser": "Ready for human merge.\n",
                 }
                 for marker, stdout in phase_output.items():
                     if marker in input:

@@ -12,7 +12,7 @@ Review the implementation diff for scope, correctness, regressions, and maintain
 
 ## Required output
 
-A JSON object with:
+End with a single-line compact JSON verdict object with:
 
 - `status`: `pass` or `fail`.
 - `findings`: severity, location, evidence, and required correction for each defect.
