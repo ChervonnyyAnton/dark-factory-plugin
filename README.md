@@ -44,11 +44,16 @@ under `.dark-factory/runs/` from the supervisor's final state.
 | Command | Description |
 |---------|-------------|
 | `/dark-factory` / `/dark-factory start` | Start the detached supervisor |
+| `/dark-factory start --issue N` | Pin a single open issue (assignee gate; ignores queue labels) |
+| `/dark-factory start --epic N` | Deliver epic children oldest-first; epic closure when all children close |
 | `/dark-factory-stop` | Request a graceful stop |
 | `/dark-factory-monitor` | Print durable controller JSON (phase, issue, wake) |
 | `/dark-factory-dry-run` | Discover/resume and prepare prompts without writes |
+| `/dark-factory-dry-run --issue N` / `--epic N` | Dry-run with the same targeting as `start` |
 | `/dark-factory:ralph …` | Start an in-session Ralph loop on one issue or task |
 | `/dark-factory:cancel` | Cancel an active Ralph Stop-loop |
+
+`--issue` and `--epic` are mutually exclusive. Slash commands pass trailing args via `$ARGUMENTS` (for example `/dark-factory-dry-run --issue 58`).
 
 The `dark-factory` skill documents the same actions for non-slash invocation.
 
