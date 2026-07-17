@@ -182,6 +182,29 @@ def select_issue(issues):
     )
 
 
+_ISSUE_FIELDS = "number,title,url,createdAt,assignees,labels,state,body"
+
+
+def resolve_issue(run, policy, number):
+    repositories = policy.get("repositories") or [_repository_from_origin(run)]
+    found = []
+    for repository in repositories:
+        result = run([
+            "gh", "issue", "view", str(number),
+            "--repo", repository,
+            "--json", _ISSUE_FIELDS,
+        ])
+        if getattr(result, "returncode", 0) != 0 or not (result.stdout or "").strip():
+            continue
+        found.append(dict(json.loads(result.stdout), repository=repository))
+    if not found:
+        raise ValueError(f"issue #{number} not found in policy repositories")
+    if len(found) > 1:
+        repos = ", ".join(item["repository"] for item in found)
+        raise ValueError(f"issue #{number} is ambiguous across repositories: {repos}")
+    return found[0]
+
+
 def reconcile(state, run, policy):
     reconciled = copy.deepcopy(state)
     current = reconciled["issue"]
