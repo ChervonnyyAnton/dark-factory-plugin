@@ -588,6 +588,64 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertEqual(len(push_commands), 1)
             self.assertLess(commands.index(push_commands[0]), commands.index(create_command))
 
+    def test_ready_for_pr_parses_structured_pr_author_output(self):
+        structured_stdout = (
+            "## Commit message\n\n"
+            "feat(widget): ship end-to-end\n\n"
+            "## Pull request title\n\n"
+            "Ship widget\n\n"
+            "## Pull request body\n\n"
+            "Implements the widget.\n"
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            store = self._store(workspace, base_state(phase="ready_for_pr"))
+            attempt = self._attempt(workspace, "success", stdout=structured_stdout)
+            commands = []
+
+            def run(command):
+                commands.append(command)
+                if is_git_push_command(command):
+                    return Result()
+                if command[:3] == ["gh", "pr", "list"]:
+                    return Result(json.dumps([]))
+                if command[:3] == ["gh", "pr", "create"]:
+                    return Result("https://github.com/org/repo/pull/7\n")
+                if command[:3] == ["gh", "pr", "view"]:
+                    return Result(json.dumps({
+                        "number": 7, "url": "https://github.com/org/repo/pull/7",
+                        "state": "OPEN", "headRefOid": "sha123", "headRefName": "dark-factory/issue-42",
+                    }))
+                raise AssertionError(f"unexpected command: {command}")
+
+            _controller_iteration(store, run, run_provider_fn=lambda *a, **k: attempt)
+
+            state = store.load()
+            self.assertEqual(state["pr_title"], "Ship widget")
+            self.assertNotIn("feat(widget)", state["pr_title"])
+            create_command = next(c for c in commands if c[:3] == ["gh", "pr", "create"])
+            self.assertEqual(create_command[create_command.index("--title") + 1], "Ship widget")
+
+    def test_repairing_prompt_includes_failed_check(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            state = base_state(
+                phase="repairing", pr=7, failed_check="unit-tests",
+                self_review={"status": "pass", "provider_status": "success", "run_dir": "unused"},
+            )
+            store = self._store(workspace, state)
+            captured = {}
+
+            def provider_fn(w, provider, prompt_path, run_id, max_turns):
+                captured["prompt"] = Path(prompt_path).read_text()
+                return self._attempt(workspace, "success", stdout="fixed\n")
+
+            _controller_iteration(
+                store, lambda c: Result(),
+                run_provider_fn=provider_fn,
+            )
+
+            self.assertIn("Failed CI check: `unit-tests`", captured["prompt"])
+            self.assertIn("## self_review", captured["prompt"])
+
     def test_manual_merge_mode_stops_at_handoff_after_green_ci(self):
         with tempfile.TemporaryDirectory() as workspace:
             store = self._store(workspace, ready_state(phase="ci_wait"))

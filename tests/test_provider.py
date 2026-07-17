@@ -16,6 +16,7 @@ loader.exec_module(dark_factory)
 
 build_phase_prompt = getattr(dark_factory, "build_phase_prompt", lambda *args: None)
 run_provider = getattr(dark_factory, "run_provider", lambda *args, **kwargs: None)
+_parse_pr_title_and_body = getattr(dark_factory, "_parse_pr_title_and_body", lambda text: ("", ""))
 
 
 class ProviderTests(unittest.TestCase):
@@ -34,6 +35,53 @@ class ProviderTests(unittest.TestCase):
             self.assertIn("# Factory Planner", contents)
             self.assertIn("Issue #42", contents)
             self.assertIn("Ship runner", contents)
+
+    def test_build_phase_prompt_repairing_includes_failed_check_and_review_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            issue = {"run_id": "run-repair", "number": 42, "title": "Ship widget"}
+            review_dir = workspace / ".dark-factory" / "runs" / "issue-42-abc123-self_review-0"
+            review_dir.mkdir(parents=True)
+            (review_dir / "stdout.txt").write_text('{"status": "pass"}\n')
+            state = {
+                "failed_check": "unit-tests",
+                "pr": 7,
+                "self_review": {
+                    "status": "pass",
+                    "provider_status": "success",
+                    "run_dir": str(review_dir),
+                },
+            }
+
+            prompt = build_phase_prompt(workspace, "repairing", issue, "repairer", state=state)
+            contents = prompt.read_text()
+
+            self.assertIn("# Factory Repairer", contents)
+            self.assertIn("Failed CI check: `unit-tests`", contents)
+            self.assertIn("Pull request: #7", contents)
+            self.assertIn("## self_review", contents)
+            self.assertIn('"status": "pass"', contents)
+            self.assertIn('{"status": "pass"}', contents)
+
+    def test_parse_pr_title_and_body_uses_labeled_sections(self):
+        text = (
+            "## Commit message\n\n"
+            "feat(widget): ship end-to-end\n\n"
+            "## Pull request title\n\n"
+            "Ship widget\n\n"
+            "## Pull request body\n\n"
+            "Implements the widget end to end.\n\n"
+            "Closes #42\n"
+        )
+        title, body = _parse_pr_title_and_body(text)
+        self.assertEqual(title, "Ship widget")
+        self.assertIn("Implements the widget end to end.", body)
+        self.assertNotIn("feat(widget)", title)
+
+    def test_parse_pr_title_and_body_legacy_first_line_title(self):
+        title, body = _parse_pr_title_and_body("Ship widget\n\nImplements the widget.\n")
+        self.assertEqual(title, "Ship widget")
+        self.assertEqual(body, "Implements the widget.")
 
     @mock.patch("subprocess.run")
     def test_success_records_provider_artifacts(self, run):
