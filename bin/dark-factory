@@ -353,6 +353,8 @@ def reconcile(state, run, policy):
     issue = dict(json.loads(result.stdout), repository=repository)
     if isinstance(current, dict) and current.get("run_id"):
         issue["run_id"] = current["run_id"]
+    if isinstance(current, dict) and current.get("selection_intent"):
+        issue["selection_intent"] = current["selection_intent"]
     if not issue_matches(issue, policy, resolve_assignees(policy, run)):
         reconciled["phase"] = "paused"
     elif isinstance(current, dict):
@@ -416,6 +418,9 @@ def build_phase_prompt(workspace, phase, issue, contract_name, *, state=None):
         f"Issue #{issue['number']}: {issue.get('title', '')}\n\n"
         f"```json\n{json.dumps(issue, indent=2, sort_keys=True)}\n```\n"
     )
+    if issue.get("selection_intent") == "epic_closure":
+        closure_contract = (ROOT / "contracts" / "epic-closure.md").read_text().rstrip()
+        text = f"{text.rstrip()}\n\n{closure_contract}\n"
     if phase == "repairing" and state:
         context = _repair_context_block(state)
         if context:
@@ -883,6 +888,24 @@ def merge_pr(run, state):
     return state
 
 
+def close_epic_if_needed(run, state):
+    issue = state.get("issue") or {}
+    if issue.get("selection_intent") != "epic_closure" or state.get("phase") != "merged":
+        return state
+    result = run([
+        "gh", "issue", "close", str(issue["number"]),
+        "--repo", issue["repository"],
+        "--comment", "Closed by Dark Factory epic closure after merge.",
+    ])
+    if getattr(result, "returncode", 0) != 0:
+        state["phase"] = "handoff"
+        state["handoff_reason"] = "merged but failed to close epic"
+        return state
+    state["phase"] = "idle"
+    state["issue"] = None
+    return state
+
+
 def _focus_dict(issue=None, epic=None):
     if issue is not None:
         return {"issue": issue}
@@ -960,12 +983,25 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
             else:
                 state["phase"] = "handoff"
                 state["handoff_reason"] = "checks green; manual merge mode awaits human merge"
-    else:
+    elif phase != "merged":
         store.save(state)
         return False
 
     if state.get("phase") in ("handoff", "merged") and state.get("phase") != phase:
         state = _author_release_note(workspace, state, policy, run_provider_fn)
+    if state.get("phase") == "merged":
+        state = close_epic_if_needed(run, state)
+        focus = state.get("focus") or {}
+        if state.get("phase") == "merged" and focus:
+            state.update(
+                phase="idle",
+                issue=None,
+                pr=None, pr_url=None, pr_title=None, pr_body=None, head_sha=None,
+                testing=None, self_review=None, security_review=None,
+                attempts={},
+            )
+            store.save(state)
+            return focus.get("epic") is not None
     store.save(state)
     return state.get("phase") not in _TERMINAL_PHASES
 

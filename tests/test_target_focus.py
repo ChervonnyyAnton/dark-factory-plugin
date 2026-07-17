@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -273,3 +274,45 @@ class SelectWithFocusTests(unittest.TestCase):
         self.assertIn("closure", summary)
         self.assertIn("unresolved child refs ignored", summary)
         self.assertIn("999", summary)
+
+
+class EpicClosureSideEffectTests(unittest.TestCase):
+    def test_close_epic_if_needed_closes_on_merged_closure(self):
+        calls = []
+
+        def run(cmd):
+            calls.append(cmd)
+            return Result()
+
+        state = {
+            "phase": "merged",
+            "issue": {
+                "number": 56,
+                "repository": "org/a",
+                "selection_intent": "epic_closure",
+                "title": "epic",
+            },
+        }
+
+        out = df.close_epic_if_needed(run, state)
+
+        self.assertEqual(out["phase"], "idle")
+        self.assertIsNone(out["issue"])
+        self.assertEqual(calls[0][:3], ["gh", "issue", "close"])
+
+    def test_build_phase_prompt_includes_epic_closure_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            issue = {
+                "number": 56,
+                "title": "epic",
+                "run_id": "dry-run-56-test",
+                "selection_intent": "epic_closure",
+                "repository": "org/a",
+            }
+
+            path = df.build_phase_prompt(root, "planning", issue, "planner")
+            text = path.read_text()
+
+        self.assertIn("Epic closure", text)
+        self.assertIn("holistically", text)

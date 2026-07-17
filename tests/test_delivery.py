@@ -484,6 +484,20 @@ class MergePrTests(unittest.TestCase):
         self.assertNotEqual(result["phase"], "merged")
 
 
+class ReconcileTests(unittest.TestCase):
+    def test_preserves_epic_closure_selection_intent(self):
+        state = base_state(issue={**ISSUE, "selection_intent": "epic_closure"})
+
+        def run(command):
+            if command[:3] == ["gh", "issue", "view"]:
+                return Result(json.dumps({k: v for k, v in ISSUE.items() if k != "run_id"}))
+            raise AssertionError(f"unexpected command: {command}")
+
+        result = reconcile(state, run, POLICY)
+
+        self.assertEqual(result["issue"]["selection_intent"], "epic_closure")
+
+
 class ControllerIterationTests(unittest.TestCase):
     def _store(self, workspace, initial=None):
         write_policy(workspace)
@@ -742,6 +756,45 @@ class ControllerIterationTests(unittest.TestCase):
             self.assertFalse(continued)
             self.assertEqual(state["phase"], "merged")
             self.assertIn(["gh", "pr", "merge"], [c[:3] for c in commands])
+
+    def test_merged_epic_child_keeps_focus_and_selects_next_child(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            state = base_state(phase="merged", focus={"epic": 56})
+            store = self._store(workspace, state)
+
+            continued = _controller_iteration(
+                store, lambda command: Result(),
+                run_provider_fn=self._release_provider(workspace),
+            )
+
+            state = store.load()
+            self.assertTrue(continued)
+            self.assertEqual(state["phase"], "idle")
+            self.assertIsNone(state["issue"])
+            self.assertEqual(state["focus"], {"epic": 56})
+
+            next_issue = dict(ISSUE, number=43, title="Next child", run_id=None)
+            with mock.patch.object(dark_factory, "_select_next_issue", return_value=next_issue) as select:
+                continued = _controller_iteration(store, lambda command: Result())
+
+            self.assertTrue(continued)
+            self.assertEqual(select.call_args.args[2], {"epic": 56})
+            self.assertEqual(store.load()["issue"]["number"], 43)
+
+    def test_merged_pinned_issue_becomes_idle_without_selecting_queue(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            state = base_state(phase="merged", focus={"issue": 42})
+            store = self._store(workspace, state)
+
+            continued = _controller_iteration(
+                store, lambda command: Result(),
+                run_provider_fn=self._release_provider(workspace),
+            )
+
+            state = store.load()
+            self.assertFalse(continued)
+            self.assertEqual(state["phase"], "idle")
+            self.assertIsNone(state["issue"])
 
     def test_auto_merge_mode_hands_off_when_gate_fails(self):
         auto_policy = {**POLICY, "merge": {"mode": "auto"}}
