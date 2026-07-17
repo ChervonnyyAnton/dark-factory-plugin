@@ -4,11 +4,28 @@ import datetime as dt
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
+from collections import namedtuple
 from pathlib import Path
 from urllib.parse import urlparse
 
+
+ROOT = Path(__file__).resolve().parents[1]
+PROVIDERS = {
+    "claude": ("claude", "-p", "--dangerously-skip-permissions"),
+    "codex": (
+        "codex",
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-",
+    ),
+}
+AttemptResult = namedtuple(
+    "AttemptResult",
+    "status returncode run_dir stdout_path stderr_path result_path handoff_path",
+)
 
 DEFAULT_STATE = {
     "version": 1,
@@ -122,6 +139,85 @@ def reconcile(state, run, policy):
     elif isinstance(current, dict):
         reconciled["issue"] = issue
     return reconciled
+
+
+def _run_directory(workspace, run_id):
+    if not run_id or Path(run_id).name != run_id:
+        raise ValueError("run_id must be a single path component")
+    run_dir = Path(workspace) / ".dark-factory" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def build_phase_prompt(workspace, phase, issue, contract_name):
+    run_dir = _run_directory(workspace, issue["run_id"])
+    contract_path = ROOT / "contracts" / f"{contract_name}.md"
+    prompt_path = run_dir / f"{phase}.prompt.md"
+    prompt_path.write_text(
+        f"{contract_path.read_text().rstrip()}\n\n"
+        f"# Selected issue\n\n"
+        f"Issue #{issue['number']}: {issue.get('title', '')}\n\n"
+        f"```json\n{json.dumps(issue, indent=2, sort_keys=True)}\n```\n"
+    )
+    return prompt_path
+
+
+def run_provider(workspace, provider, prompt_file, run_id, *, max_turns):
+    try:
+        command = list(PROVIDERS[provider])
+    except KeyError as error:
+        raise ValueError(f"unknown provider: {provider}") from error
+
+    run_dir = _run_directory(workspace, run_id)
+    stdout_path = run_dir / "stdout.txt"
+    stderr_path = run_dir / "stderr.txt"
+    result_path = run_dir / "result.json"
+    handoff_path = run_dir / "handoff.md"
+    prompt = Path(prompt_file).read_text()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=Path(workspace),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
+    except OSError as error:
+        returncode = 127
+        stdout = ""
+        stderr = str(error)
+
+    capacity_markers = ("capacity", "quota", "rate limit", "usage limit")
+    if returncode == 0:
+        status = "success"
+    elif any(marker in stderr.lower() for marker in capacity_markers):
+        status = "capacity_exhausted"
+    else:
+        status = "failed"
+
+    stdout_path.write_text(stdout)
+    stderr_path.write_text(stderr)
+    handoff_path.write_text(stdout)
+    result_path.write_text(json.dumps({
+        "command": command,
+        "max_turns": max_turns,
+        "provider": provider,
+        "returncode": returncode,
+        "status": status,
+    }, indent=2, sort_keys=True) + "\n")
+    return AttemptResult(
+        status,
+        returncode,
+        run_dir,
+        stdout_path,
+        stderr_path,
+        result_path,
+        handoff_path,
+    )
 
 
 class StateStore:
@@ -309,7 +405,29 @@ class ControllerLock:
 
 
 def main(argv=None):
-    return 0
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        return 0
+    if arguments[0] != "provider":
+        raise ValueError(f"unknown subcommand: {arguments[0]}")
+    if len(arguments) not in (5, 7):
+        raise ValueError(
+            "usage: dark-factory provider WORKSPACE PROVIDER PROMPT RUN_ID "
+            "[--max-turns N]"
+        )
+    max_turns = 40
+    if len(arguments) == 7:
+        if arguments[5] != "--max-turns":
+            raise ValueError("expected --max-turns")
+        max_turns = int(arguments[6])
+    result = run_provider(
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        arguments[4],
+        max_turns=max_turns,
+    )
+    return result.returncode
 
 
 if __name__ == "__main__":
