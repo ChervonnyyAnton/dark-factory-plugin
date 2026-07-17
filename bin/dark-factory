@@ -37,6 +37,7 @@ DEFAULT_STATE = {
     "phase": "idle",
     "project": None,
     "issue": None,
+    "focus": None,
     "pr": None,
     "pr_url": None,
     "pr_title": None,
@@ -182,6 +183,158 @@ def select_issue(issues):
     )
 
 
+_ISSUE_FIELDS = "number,title,url,createdAt,assignees,labels,state,body"
+
+
+def resolve_issue(run, policy, number):
+    repositories = policy.get("repositories") or [_repository_from_origin(run)]
+    found = []
+    for repository in repositories:
+        result = run([
+            "gh", "issue", "view", str(number),
+            "--repo", repository,
+            "--json", _ISSUE_FIELDS,
+        ])
+        if getattr(result, "returncode", 0) != 0 or not (result.stdout or "").strip():
+            continue
+        found.append(dict(json.loads(result.stdout), repository=repository))
+    if not found:
+        raise ValueError(f"issue #{number} not found in policy repositories")
+    if len(found) > 1:
+        repos = ", ".join(item["repository"] for item in found)
+        raise ValueError(f"issue #{number} is ambiguous across repositories: {repos}")
+    return found[0]
+
+
+def _assignee_logins(issue):
+    return {a.get("login") for a in issue.get("assignees", []) if a.get("login")}
+
+
+def select_pinned_issue(run, policy, number):
+    issue = resolve_issue(run, policy, number)
+    if str(issue.get("state", "")).upper() != "OPEN":
+        raise ValueError(f"issue #{number} is not open")
+    assignees = set(resolve_assignees(policy, run))
+    if not (_assignee_logins(issue) & assignees):
+        raise ValueError(f"issue #{number} is not assigned to the policy assignees")
+    return issue
+
+
+_CHILD_RE = re.compile(r"#(\d+)\b")
+
+
+def discover_epic_child_numbers(run, epic):
+    numbers = []
+    seen = set()
+    repository = epic["repository"]
+    owner, name = repository.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){issue(number:$number){"
+        "trackedIssues(first:100){nodes{number}}}}}"
+    )
+    result = run([
+        "gh", "api", "graphql",
+        "-f", f"query={query}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+        "-F", f"number={epic['number']}",
+    ])
+    if getattr(result, "returncode", 0) == 0 and (result.stdout or "").strip():
+        try:
+            nodes = (
+                json.loads(result.stdout)
+                .get("data", {})
+                .get("repository", {})
+                .get("issue", {})
+                .get("trackedIssues", {})
+                .get("nodes", [])
+            )
+        except json.JSONDecodeError:
+            nodes = []
+        for node in nodes or []:
+            number = node.get("number")
+            if isinstance(number, int) and number not in seen:
+                seen.add(number)
+                numbers.append(number)
+    for match in _CHILD_RE.finditer(epic.get("body") or ""):
+        number = int(match.group(1))
+        if number == epic["number"] or number in seen:
+            continue
+        seen.add(number)
+        numbers.append(number)
+    return numbers
+
+
+def epic_child_eligible(issue, policy, assignees):
+    if str(issue.get("state", "")).upper() != "OPEN":
+        return False
+    logins = _assignee_logins(issue)
+    assignee_set = set(assignees)
+    if logins and not (logins & assignee_set):
+        return False
+    labels = policy.get("queue", {}).get("labels") or []
+    if labels:
+        issue_labels = {label.get("name") for label in issue.get("labels", [])}
+        if not (issue_labels & set(labels)):
+            return False
+    return True
+
+
+def select_with_focus(run, policy, *, issue=None, epic=None):
+    if issue is not None and epic is not None:
+        raise ValueError("--issue and --epic are mutually exclusive")
+    if issue is not None:
+        selected = select_pinned_issue(run, policy, issue)
+        return selected, f"pinned issue #{selected['number']}"
+    if epic is None:
+        selected = select_issue(list_matching_issues(run, policy))
+        if selected is None:
+            return None, "no eligible issue"
+        return selected, f"queue selected issue #{selected['number']}"
+
+    epic_issue = resolve_issue(run, policy, epic)
+    assignees = resolve_assignees(policy, run)
+    if str(epic_issue.get("state", "")).upper() != "OPEN":
+        return None, f"epic #{epic} is already closed; nothing to deliver"
+    if not (_assignee_logins(epic_issue) & set(assignees)):
+        raise ValueError(f"epic #{epic} is not assigned to the policy assignees")
+
+    resolved = []
+    unresolved = []
+    for number in discover_epic_child_numbers(run, epic_issue):
+        try:
+            resolved.append(resolve_issue(run, policy, number))
+        except ValueError:
+            unresolved.append(number)
+
+    eligible = [
+        child for child in resolved
+        if epic_child_eligible(child, policy, assignees)
+    ]
+    if eligible:
+        selected = select_issue(eligible)
+        summary = f"epic #{epic} child #{selected['number']}"
+        if unresolved:
+            summary += f"; unresolved child refs ignored: {unresolved}"
+        return selected, summary
+
+    open_resolved = [
+        child for child in resolved
+        if str(child.get("state", "")).upper() == "OPEN"
+    ]
+    if open_resolved:
+        raise ValueError(
+            f"epic #{epic} has open children that are not eligible under policy"
+        )
+
+    selected = dict(epic_issue, selection_intent="epic_closure")
+    summary = f"epic #{epic} closure"
+    if unresolved:
+        summary += f"; unresolved child refs ignored: {unresolved}"
+    return selected, summary
+
+
 def reconcile(state, run, policy):
     reconciled = copy.deepcopy(state)
     current = reconciled["issue"]
@@ -191,7 +344,7 @@ def reconcile(state, run, policy):
     else:
         repository = reconciled["repository"]
         number = current
-    fields = "number,title,url,createdAt,assignees,labels"
+    fields = "number,title,url,createdAt,state,assignees,labels"
     result = run([
         "gh", "issue", "view", str(number),
         "--repo", repository,
@@ -200,7 +353,21 @@ def reconcile(state, run, policy):
     issue = dict(json.loads(result.stdout), repository=repository)
     if isinstance(current, dict) and current.get("run_id"):
         issue["run_id"] = current["run_id"]
-    if not issue_matches(issue, policy, resolve_assignees(policy, run)):
+    if isinstance(current, dict) and current.get("selection_intent"):
+        issue["selection_intent"] = current["selection_intent"]
+    assignees = resolve_assignees(policy, run)
+    is_epic_closure = issue.get("selection_intent") == "epic_closure"
+    is_pinned_issue = (reconciled.get("focus") or {}).get("issue") == number
+    if is_epic_closure or is_pinned_issue:
+        matches_policy = (
+            str(issue.get("state", "")).upper() == "OPEN"
+            and bool(_assignee_logins(issue) & set(assignees))
+        )
+    elif (reconciled.get("focus") or {}).get("epic") is not None:
+        matches_policy = epic_child_eligible(issue, policy, assignees)
+    else:
+        matches_policy = issue_matches(issue, policy, assignees)
+    if not matches_policy:
         reconciled["phase"] = "paused"
     elif isinstance(current, dict):
         reconciled["issue"] = issue
@@ -263,6 +430,9 @@ def build_phase_prompt(workspace, phase, issue, contract_name, *, state=None):
         f"Issue #{issue['number']}: {issue.get('title', '')}\n\n"
         f"```json\n{json.dumps(issue, indent=2, sort_keys=True)}\n```\n"
     )
+    if issue.get("selection_intent") == "epic_closure":
+        closure_contract = (ROOT / "contracts" / "epic-closure.md").read_text().rstrip()
+        text = f"{text.rstrip()}\n\n{closure_contract}\n"
     if phase == "repairing" and state:
         context = _repair_context_block(state)
         if context:
@@ -490,6 +660,12 @@ def push_branch(run, workspace, branch):
     if returncode != 0:
         raise RuntimeError(getattr(result, "stderr", "") or "git push failed")
     return result
+
+
+def reset_workspace_to_main(run, root):
+    run(["git", "-C", str(root), "fetch", "origin"])
+    run(["git", "-C", str(root), "checkout", "main"])
+    run(["git", "-C", str(root), "reset", "--hard", "origin/main"])
 
 
 def open_pr(run, state, workspace):
@@ -730,8 +906,34 @@ def merge_pr(run, state):
     return state
 
 
-def _select_next_issue(run, policy):
-    return select_issue(list_matching_issues(run, policy))
+def close_epic_if_needed(run, state):
+    issue = state.get("issue") or {}
+    if issue.get("selection_intent") != "epic_closure" or state.get("phase") != "merged":
+        return state
+    result = run([
+        "gh", "issue", "close", str(issue["number"]),
+        "--repo", issue["repository"],
+        "--comment", "Closed by Dark Factory epic closure after merge.",
+    ])
+    if getattr(result, "returncode", 0) != 0:
+        state["phase"] = "handoff"
+        state["handoff_reason"] = "merged but failed to close epic"
+        return state
+    state["phase"] = "idle"
+    state["issue"] = None
+    return state
+
+
+def _focus_dict(issue=None, epic=None):
+    if issue is not None:
+        return {"issue": issue}
+    if epic is not None:
+        return {"epic": epic}
+    return None
+
+
+def _select_next_issue(run, policy, focus=None):
+    return select_with_focus(run, policy, **(focus or {}))[0]
 
 
 def _controller_iteration(store, run, *, run_provider_fn=run_provider):
@@ -752,7 +954,7 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
     policy = load_policy(workspace)
 
     if state.get("issue") is None:
-        selected = _select_next_issue(run, policy)
+        selected = _select_next_issue(run, policy, state.get("focus"))
         if selected is None:
             state["phase"] = "idle"
             store.save(state)
@@ -799,12 +1001,28 @@ def _controller_iteration(store, run, *, run_provider_fn=run_provider):
             else:
                 state["phase"] = "handoff"
                 state["handoff_reason"] = "checks green; manual merge mode awaits human merge"
-    else:
+    elif phase != "merged":
         store.save(state)
         return False
 
     if state.get("phase") in ("handoff", "merged") and state.get("phase") != phase:
         state = _author_release_note(workspace, state, policy, run_provider_fn)
+    if state.get("phase") == "merged":
+        state = close_epic_if_needed(run, state)
+        focus = state.get("focus") or {}
+        if state.get("phase") == "merged" and focus:
+            if focus.get("epic") is not None:
+                reset_workspace_to_main(run, workspace)
+            state.update(
+                phase="idle",
+                issue=None,
+                pr=None, pr_url=None, pr_title=None, pr_body=None, head_sha=None,
+                branch=None, ci_checks=None, failed_check=None, merge_error=None,
+                testing=None, self_review=None, security_review=None,
+                attempts={},
+            )
+            store.save(state)
+            return focus.get("epic") is not None
     store.save(state)
     return state.get("phase") not in _TERMINAL_PHASES
 
@@ -1053,16 +1271,21 @@ def monitor_controller(root):
     return output
 
 
-def _worker_command(root):
-    return [
+def _worker_command(root, issue=None, epic=None):
+    command = [
         str(Path(__file__).resolve()),
         "run",
         "--workspace",
         str(Path(root).resolve()),
     ]
+    if issue is not None:
+        command.extend(["--issue", str(issue)])
+    if epic is not None:
+        command.extend(["--epic", str(epic)])
+    return command
 
 
-def start_controller(root, handshake_timeout=10):
+def start_controller(root, handshake_timeout=10, issue=None, epic=None):
     root = Path(root).resolve()
     if not (root / ".dark-factory" / "policy.json").is_file():
         raise RuntimeError(f"missing policy: {root / '.dark-factory' / 'policy.json'}")
@@ -1077,10 +1300,15 @@ def start_controller(root, handshake_timeout=10):
         )
         if state.get("requested") in ("starting", "running") and worker_live:
             raise RuntimeError("dark-factory controller is already running")
-        state.update(requested="starting", worker_pid=None, startup_error=None)
+        state.update(
+            requested="starting",
+            worker_pid=None,
+            startup_error=None,
+            focus=_focus_dict(issue, epic),
+        )
         store.save(state, force_requested="starting")
         process = subprocess.Popen(
-            _worker_command(root),
+            _worker_command(root, issue=issue, epic=epic),
             cwd=root,
             start_new_session=True,
             stdin=subprocess.DEVNULL,
@@ -1107,7 +1335,7 @@ def start_controller(root, handshake_timeout=10):
         raise RuntimeError("dark-factory worker failed to publish PID handshake")
 
 
-def run_controller(root):
+def run_controller(root, issue=None, epic=None):
     root = Path(root).resolve()
     store = _state_for(root)
     with ControllerLock(root):
@@ -1119,6 +1347,7 @@ def run_controller(root):
         state.update(
             requested="running",
             worker_pid=os.getpid(),
+            focus=_focus_dict(issue, epic),
             updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         )
         store.save(state, force_requested="running")
@@ -1132,35 +1361,39 @@ def _gh_run(command):
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def dry_run_controller(root, run=_gh_run):
+def dry_run_controller(root, run=_gh_run, issue=None, epic=None):
     root = Path(root).resolve()
     policy = load_policy(root)
     store = _state_for(root)
     state = store.load()
-    issue = state.get("issue")
-    if not isinstance(issue, dict):
-        issue = select_issue(list_matching_issues(run, policy))
-        if issue is None:
-            state.update(
-                requested="stopped",
-                phase="idle",
-                dry_run_summary="dry-run: no eligible issue",
-            )
-            store.save(state, force_requested="stopped")
-            print(state["dry_run_summary"])
-            return 0
-        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
-    elif not issue.get("run_id"):
-        issue = dict(issue, run_id=f"dry-run-{issue['number']}-{uuid.uuid4().hex[:8]}")
-    prompt = build_phase_prompt(root, "planning", issue, "planner")
+    selected, selection_summary = select_with_focus(
+        run, policy, issue=issue, epic=epic,
+    )
+    focus = _focus_dict(issue, epic)
+    if selected is None:
+        state.update(
+            requested="stopped",
+            phase="idle",
+            issue=None,
+            focus=focus,
+            dry_run_summary=f"dry-run: {selection_summary}",
+            dry_run_prompt=None,
+            updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        store.save(state, force_requested="stopped")
+        print(state["dry_run_summary"])
+        return 0
+    selected = dict(selected, run_id=f"dry-run-{selected['number']}-{uuid.uuid4().hex[:8]}")
+    prompt = build_phase_prompt(root, "planning", selected, "planner")
     summary = (
-        f"dry-run: selected issue #{issue['number']}; prepared {prompt}; "
+        f"dry-run: {selection_summary}; prepared {prompt}; "
         "no provider, PR, or merge commands ran"
     )
     state.update(
         requested="stopped",
         phase="dry_run",
-        issue=issue,
+        issue=selected,
+        focus=focus,
         dry_run_prompt=str(prompt),
         dry_run_summary=summary,
         updated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1196,20 +1429,26 @@ def main(argv=None):
     parser.add_argument("action", choices=("start", "stop", "monitor", "run"))
     parser.add_argument("--workspace", default=".")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--issue", type=int)
+    parser.add_argument("--epic", type=int)
     args = parser.parse_args(arguments)
     if args.dry_run and args.action != "run":
         parser.error("--dry-run is only valid with run")
+    if args.issue is not None and args.epic is not None:
+        parser.error("--issue and --epic are mutually exclusive")
+    if (args.issue is not None or args.epic is not None) and args.action not in ("start", "run"):
+        parser.error("--issue/--epic are only valid with start or run")
     root = Path(args.workspace).resolve()
     if args.action == "start":
-        return start_controller(root)
+        return start_controller(root, issue=args.issue, epic=args.epic)
     if args.action == "stop":
         return stop_controller(root)
     if args.action == "monitor":
         monitor_controller(root)
         return 0
     if args.dry_run:
-        return dry_run_controller(root)
-    return run_controller(root)
+        return dry_run_controller(root, issue=args.issue, epic=args.epic)
+    return run_controller(root, issue=args.issue, epic=args.epic)
 
 
 if __name__ == "__main__":
