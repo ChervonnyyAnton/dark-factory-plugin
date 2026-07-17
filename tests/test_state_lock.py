@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "bin" / "dark-factory"
@@ -74,6 +75,20 @@ class ControllerLockTests(unittest.TestCase):
                 lock.release()
 
             self.assertFalse(lock_path.exists())
+
+    def test_short_write_still_publishes_a_complete_record(self):
+        original_write = os.write
+
+        def short_write(descriptor, contents):
+            return original_write(descriptor, contents[:3])
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(dark_factory.os, "write", side_effect=short_write):
+                with ControllerLock(root):
+                    record = json.loads(
+                        (Path(root) / ".dark-factory" / "controller.lock").read_text()
+                    )
+            self.assertEqual(record["pid"], os.getpid())
 
 
 if __name__ == "__main__":

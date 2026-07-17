@@ -134,7 +134,7 @@ class ControllerLock:
                     "pid": os.getpid(),
                     "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 }
-                os.write(descriptor, (json.dumps(record) + "\n").encode())
+                self._write_all(descriptor, (json.dumps(record) + "\n").encode())
                 os.fsync(descriptor)
                 os.link(temporary_path, self.path)
                 published = True
@@ -204,6 +204,14 @@ class ControllerLock:
             descriptor_status.st_dev,
             descriptor_status.st_ino,
         )
+
+    @staticmethod
+    def _write_all(descriptor, contents):
+        while contents:
+            written = os.write(descriptor, contents)
+            if written <= 0:
+                raise OSError("could not write controller lock record")
+            contents = contents[written:]
 
     @staticmethod
     def _read_record(descriptor):
